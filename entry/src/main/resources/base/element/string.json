@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "label"
+    },
+    {
+      "name": "bluetooth_permission_reason",
+      "value": "用于连接已配对车机的 iAP2 蓝牙通道"
+    },
+    {
+      "name": "wifi_permission_reason",
+      "value": "用于连接车机热点并访问 CarPlay 网络服务"
+    },
+    {
+      "name": "system_capability_permission_reason",
+      "value": "用于验证 CarPlay 虚拟屏和触摸回控所需的系统能力"
+    }
+  ]
+}
