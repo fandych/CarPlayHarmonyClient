@@ -1,0 +1,56 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\fandych\\.ohos\\config\\default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "00000019C474C0D2E53EDD9A5EBAC45962FA7AF5242E0798529D64C06F66D35233A369C5F12E53DF10",
+          "profile": "C:\\Users\\fandych\\.ohos\\config\\default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\fandych\\.ohos\\config\\default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.p12",
+          "storePassword": "00000019605F7D9C5321F7ED7DB9D83DFD8E376E7D8DBF80459A4C06F3549CF9C276D1E3FEF864E2C8"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "26.0.0",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "HarmonyOS API 26 wireless CarPlay sender"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Wireless CarPlay sender control panel"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "CarPlay 发送端"
+    },
+    {
+      "name": "permission_bluetooth",
+      "value": "用于与已配对车机建立 iAP2 蓝牙连接"
+    },
+    {
+      "name": "permission_wifi",
+      "value": "用于加入车机无线网络并发现 AirPlay 服务"
+    },
+    {
+      "name": "permission_bundle_info",
+      "value": "用于读取用户手动添加的应用名称及可启动页面"
+    }
+  ]
+}

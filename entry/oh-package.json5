@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "HarmonyOS API 26 wireless CarPlay sender prototype.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {}
+}
