@@ -1,8 +1,13 @@
 import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
-import { preferences } from '@kit.ArkData';
 import { deviceInfo } from '@kit.BasicServicesKit';
+import display from '@ohos.display';
 import { HarmonySppClient, PairedAccessory, SppConnection } from '../../platform/bluetooth/HarmonySppClient';
 import { HarmonyBluetoothIdentityProvider } from '../../platform/bluetooth/HarmonyBluetoothIdentityProvider';
+import {
+  BluetoothIdentitySource, ConfiguredBluetoothIdentityProvider
+} from '../../platform/bluetooth/ConfiguredBluetoothIdentityProvider';
+import { carPlaySettings } from '../../platform/settings/HarmonySettings';
+import { chooseAirPlayEndpoint, configuredAirPlay, resolveSessionWifi } from '../settings/SettingsFallbacks';
 import { carPlayDiagnostics } from '../../platform/diagnostics/CarPlayDiagnostics';
 import { describeFailure } from '../../platform/diagnostics/DiagnosticFormat';
 import { Iap2LinkEngine, Iap2LinkState } from '../../protocol/iap2/Iap2LinkEngine';
@@ -14,6 +19,7 @@ import {
 import { HarmonyWifiClient } from '../../platform/network/HarmonyWifiClient';
 import { AirPlayServiceEndpoint, HarmonyMdnsBrowser } from '../../platform/network/HarmonyMdnsBrowser';
 import { HarmonyAirPlayClient } from '../../platform/network/HarmonyAirPlayClient';
+import { HarmonyAirPlayMediaSession } from '../../platform/network/HarmonyAirPlayMediaSession';
 import {
   CarPlayInviteServer
 } from '../../platform/network/HarmonyCarPlayInviteServer';
@@ -21,7 +27,8 @@ import { CarPlayInviteRequest } from '../../protocol/airplay/CarPlayInviteProtoc
 
 export type CarPlaySessionState =
   'idle' | 'connecting' | 'bluetooth-connected' | 'iap2-negotiating' | 'iap2-ready' |
-  'wifi-pending' | 'wifi-connected' | 'airplay-found' | 'blocked' | 'error';
+  'wifi-pending' | 'wifi-connected' | 'airplay-found' | 'media-negotiating' |
+  'waiting-video' | 'screen-capture-pending' | 'streaming' | 'blocked' | 'error';
 
 export function isCarPlaySessionActive(state: CarPlaySessionState): boolean {
   return state !== 'idle' && state !== 'error' && state !== 'blocked';
@@ -35,6 +42,9 @@ export interface CarPlaySessionSnapshot {
   logSession: string;
   logFailure: string;
   blockedReason: string;
+  connectedDeviceName: string;
+  identitySource: BluetoothIdentitySource;
+  systemBluetoothAddress: string;
 }
 
 type SessionListener = (snapshot: CarPlaySessionSnapshot) => void;
@@ -46,11 +56,17 @@ class CarPlaySessionController {
   private logs: string[] = [];
   private devices: PairedAccessory[] = [];
   private selectedDeviceId: string = '';
-  private settings: preferences.Preferences | undefined = undefined;
   private blockedReason: string = '';
-  private identityProvider: HarmonyBluetoothIdentityProvider | undefined = undefined;
+  private identityProvider: ConfiguredBluetoothIdentityProvider | undefined = undefined;
   private realBluetoothAddress: string | undefined = undefined;
+  private identitySource: BluetoothIdentitySource = 'unavailable';
+  private systemBluetoothAddress: string = '';
+  private connectedDeviceName: string = '';
+  private restored: boolean = false;
   private iap2Timer: number | undefined = undefined;
+  private wifiFallbackTimer: number | undefined = undefined;
+  private airPlayFallbackTimer: number | undefined = undefined;
+  private manualEndpointAllowed: boolean = false;
   private state: CarPlaySessionState = 'idle';
   private abilityContext: common.UIAbilityContext | undefined = undefined;
   private generation: number = 0;
@@ -60,6 +76,7 @@ class CarPlaySessionController {
   private wifiClient: HarmonyWifiClient | undefined = undefined;
   private mdnsBrowser: HarmonyMdnsBrowser | undefined = undefined;
   private inviteServer: CarPlayInviteServer | undefined = undefined;
+  private airPlayMediaSession: HarmonyAirPlayMediaSession | undefined = undefined;
   private pendingStartSession: CarPlayStartSessionEndpoint | undefined = undefined;
   private latestAirPlayEndpoint: AirPlayServiceEndpoint | undefined = undefined;
   private readonly airPlayProbeKeys: Set<string> = new Set<string>();
@@ -76,22 +93,66 @@ class CarPlaySessionController {
       }
       this.notify();
     });
+    carPlaySettings.subscribe((snapshot) => {
+      if (snapshot.ready) {
+        this.selectedDeviceId = snapshot.settings.targetDeviceId;
+        if (!snapshot.settings.enabled && isCarPlaySessionActive(this.state)) {
+          this.stop();
+        }
+        this.notify();
+      }
+    });
   }
 
-  setContext(context: common.UIAbilityContext): void {
+  async setContext(context: common.UIAbilityContext): Promise<void> {
     this.abilityContext = context;
+    this.restored = false;
     carPlayDiagnostics.initialize(context.filesDir);
     this.appendLog(`phone=${deviceInfo.productModel}; osBuild=${deviceInfo.osFullName.replace(/\./g, '_')}; sdk=${deviceInfo.sdkApiVersion}`);
-    this.blockedReason = '本机蓝牙身份尚未检测；需要系统接口 access.getLocalAddress 及 GET_BLUETOOTH_LOCAL_MAC 系统权限。';
+    this.blockedReason = '本机身份尚未检测；自动读取不可用时，可在设置中填写本机真实蓝牙地址。';
     this.appendLog(this.blockedReason);
-    try {
-      this.settings = preferences.getPreferencesSync(context, { name: 'carplay-settings' });
-      const selected = this.settings.getSync('targetDeviceId', '');
-      this.selectedDeviceId = typeof selected === 'string' ? selected : '';
-    } catch (error) {
-      this.appendLog(`读取接收端设置失败：${describeFailure(error)}`, true);
-    }
+    await carPlaySettings.initialize(context);
     this.notify();
+  }
+
+  async setEnabled(enabled: boolean): Promise<void> {
+    if (!enabled) {
+      this.stop();
+    }
+    await carPlaySettings.setEnabled(enabled);
+    if (enabled) {
+      void this.start().catch((error: Error) => this.failSession(`连接启动异常：${describeFailure(error)}`));
+    }
+  }
+
+  async restoreEnabledOnce(): Promise<void> {
+    if (this.restored) {
+      return;
+    }
+    this.restored = true;
+    const snapshot = carPlaySettings.snapshot();
+    if (!snapshot.ready || !snapshot.settings.enabled) {
+      return;
+    }
+    const context = this.abilityContext;
+    if (context === undefined) {
+      return;
+    }
+    const accessManager = abilityAccessCtrl.createAtManager();
+    const granted = accessManager.checkAccessTokenSync(context.applicationInfo.accessTokenId, 'ohos.permission.ACCESS_BLUETOOTH');
+    if (snapshot.settings.targetDeviceId.length === 0 ||
+      granted !== abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+      this.blockSession('已记住 CarPlay 开启状态；请在设置选择接收端，并手动重试以完成蓝牙授权。');
+      return;
+    }
+    if (snapshot.settings.localBluetoothAddress.length === 0 &&
+      accessManager.checkAccessTokenSync(context.applicationInfo.accessTokenId,
+        'ohos.permission.GET_BLUETOOTH_LOCAL_MAC') !== abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+      this.blockSession('已记住 CarPlay 开启状态，但缺少可用的本机蓝牙地址；请在设置填写后重试。');
+      return;
+    }
+    this.appendLog('恢复已保存的 CarPlay 开启意图；本次应用启动仅自动尝试一次。');
+    await this.start();
   }
 
   subscribe(listener: SessionListener): () => void {
@@ -110,7 +171,10 @@ class CarPlaySessionController {
       selectedDeviceId: this.selectedDeviceId,
       logSession: carPlayDiagnostics.currentSession(),
       logFailure: carPlayDiagnostics.failure(),
-      blockedReason: this.blockedReason
+      blockedReason: this.blockedReason,
+      connectedDeviceName: this.connectedDeviceName,
+      identitySource: this.identitySource,
+      systemBluetoothAddress: this.systemBluetoothAddress
     };
   }
 
@@ -157,7 +221,11 @@ class CarPlaySessionController {
     if (context === undefined) {
       throw new Error('应用上下文尚未准备就绪。');
     }
-    const provider = new HarmonyBluetoothIdentityProvider(context.applicationInfo.accessTokenId);
+    const provider = new ConfiguredBluetoothIdentityProvider(
+      new HarmonyBluetoothIdentityProvider(context.applicationInfo.accessTokenId),
+      carPlaySettings.snapshot().settings.localBluetoothAddress,
+      (message: string) => this.appendLog(message)
+    );
     try {
       const address = await provider.getStableBluetoothAddress();
       if (generation !== undefined && !this.isCurrent(generation)) {
@@ -165,35 +233,22 @@ class CarPlaySessionController {
       }
       this.identityProvider = provider;
       this.realBluetoothAddress = address;
+      this.identitySource = provider.identitySource();
+      this.systemBluetoothAddress = this.identitySource === 'system' ? address : '';
       this.blockedReason = '';
-      this.appendLog('本机真实蓝牙身份已由 access.getLocalAddress 读取并校验；不将地址写入日志。');
+      this.appendLog(`本机蓝牙身份格式已校验；source=${this.identitySource}，不将地址写入日志。` +
+        (this.identitySource === 'manual' ? '手动地址由用户声明为本机真实地址，需接收端实测确认一致性。' : ''));
     } catch (error) {
       if (generation !== undefined && !this.isCurrent(generation)) {
         return;
       }
       this.identityProvider = undefined;
       this.realBluetoothAddress = undefined;
+      this.identitySource = 'unavailable';
+      this.systemBluetoothAddress = '';
       this.blockedReason = `本机蓝牙身份不可用：${describeFailure(error)}`;
       this.appendLog(this.blockedReason, true);
     }
-    this.notify();
-  }
-
-  selectAccessory(deviceId: string): void {
-    if (isCarPlaySessionActive(this.state) || !this.devices.some((device: PairedAccessory) => device.deviceId === deviceId)) {
-      throw new Error('不能在连接过程中选择接收端，或设备已不在配对列表中。');
-    }
-    this.selectedDeviceId = deviceId;
-    try {
-      if (this.settings === undefined) {
-        throw new Error('接收端设置存储不可用。');
-      }
-      this.settings.putSync('targetDeviceId', deviceId);
-      this.settings.flushSync();
-    } catch (error) {
-      this.appendLog(`接收端选择仅本次有效，持久化失败：${describeFailure(error)}`, true);
-    }
-    this.appendLog(`已选择接收端 ${carPlayDiagnostics.identifier(deviceId)}。`);
     this.notify();
   }
 
@@ -220,9 +275,6 @@ class CarPlaySessionController {
 
   private loadAccessories(): void {
     this.devices = this.sppClient.pairedAccessories();
-    if (!this.devices.some((device: PairedAccessory) => device.deviceId === this.selectedDeviceId)) {
-      this.selectedDeviceId = '';
-    }
     this.appendLog(`读取到 ${this.devices.length} 个已配对设备；只连接用户选定的接收端。`);
     this.notify();
   }
@@ -239,6 +291,10 @@ class CarPlaySessionController {
     if (context === undefined) {
       this.setState('error');
       this.appendLog('应用上下文尚未准备就绪，无法启动连接。');
+      return;
+    }
+    if (!carPlaySettings.snapshot().ready) {
+      this.failSession('配置尚未成功载入，不能启动连接。');
       return;
     }
 
@@ -284,6 +340,7 @@ class CarPlaySessionController {
         return;
       }
       this.connection = connection;
+      this.connectedDeviceName = target.name;
       this.setState('bluetooth-connected');
       this.identificationStarted = false;
       const link = new Iap2LinkEngine((bytes: Uint8Array) => {
@@ -327,11 +384,75 @@ class CarPlaySessionController {
     }
   }
 
+  startProjection(): void {
+    if (this.state !== 'waiting-video') {
+      throw new Error('Projection can start only after the AirPlay media channel is ready.');
+    }
+    const mediaSession = this.airPlayMediaSession;
+    if (mediaSession === undefined) {
+      throw new Error('The AirPlay media session is no longer available.');
+    }
+    const generation = this.generation;
+    const screen = display.getDefaultDisplaySync();
+    if (screen.width < 2 || screen.height < 2) {
+      throw new Error('The system returned invalid screen dimensions.');
+    }
+    const scale = Math.min(1, 1280 / Math.max(screen.width, screen.height));
+    const width = Math.max(2, Math.floor(screen.width * scale / 2) * 2);
+    const height = Math.max(2, Math.floor(screen.height * scale / 2) * 2);
+    this.setState('screen-capture-pending');
+    try {
+      mediaSession.startScreenCapture(
+        width,
+        height,
+        screen.id,
+        () => {
+          if (this.isCurrent(generation) && this.airPlayMediaSession === mediaSession) {
+            this.setState('streaming');
+          }
+        },
+        (reason: string) => {
+          if (this.isCurrent(generation) && this.airPlayMediaSession === mediaSession) {
+            this.appendLog(`系统停止屏幕采集：${reason}`);
+            this.setState('waiting-video');
+          }
+        }
+      );
+    } catch (error) {
+      this.setState('waiting-video');
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.appendLog(`启动用户授权屏幕采集失败：${describeFailure(failure)}`, true);
+      throw failure;
+    }
+  }
+
+  async stopProjection(): Promise<void> {
+    const mediaSession = this.airPlayMediaSession;
+    if (mediaSession === undefined) {
+      return;
+    }
+    await mediaSession.stopScreenCapture();
+    if (this.airPlayMediaSession === mediaSession &&
+      (this.state === 'screen-capture-pending' || this.state === 'streaming')) {
+      this.setState('waiting-video');
+    }
+  }
+
   stop(): void {
     this.generation++;
     this.sppClient.stop();
     this.identityProvider = undefined;
     this.realBluetoothAddress = undefined;
+    this.connectedDeviceName = '';
+    this.manualEndpointAllowed = false;
+    if (this.wifiFallbackTimer !== undefined) {
+      clearTimeout(this.wifiFallbackTimer);
+      this.wifiFallbackTimer = undefined;
+    }
+    if (this.airPlayFallbackTimer !== undefined) {
+      clearTimeout(this.airPlayFallbackTimer);
+      this.airPlayFallbackTimer = undefined;
+    }
     if (this.iap2Timer !== undefined) {
       clearTimeout(this.iap2Timer);
       this.iap2Timer = undefined;
@@ -353,6 +474,13 @@ class CarPlaySessionController {
       this.inviteServer = undefined;
       cleanupTasks.push(inviteServer.stop().catch((error: Error) => {
         this.appendLog(`停止 CarPlay 邀请服务失败：${error.message}`);
+      }));
+    }
+    if (this.airPlayMediaSession !== undefined) {
+      const mediaSession = this.airPlayMediaSession;
+      this.airPlayMediaSession = undefined;
+      cleanupTasks.push(mediaSession.close().catch((error: Error) => {
+        this.appendLog(`关闭 AirPlay 媒体会话失败：${describeFailure(error)}`, true);
       }));
     }
     if (this.mdnsBrowser !== undefined) {
@@ -428,7 +556,9 @@ class CarPlaySessionController {
         },
         (endpoint: CarPlayStartSessionEndpoint) => this.onCarPlayStartSession(endpoint, generation),
         (reason: string) => this.blockSession(reason),
-        this.realBluetoothAddress
+        this.realBluetoothAddress,
+        carPlaySettings.snapshot().settings.deviceName,
+        () => this.armWifiFallback(generation)
       );
       this.senderSession.start();
     } else if (state === 'negotiating') {
@@ -530,6 +660,7 @@ class CarPlaySessionController {
         (endpoint: AirPlayServiceEndpoint) => this.onAirPlayEndpoint(endpoint, generation)
       );
       this.probePendingStartSession(generation);
+      this.armAirPlayFallback(generation);
     } catch (error) {
       if (this.isCurrent(generation)) {
         this.failSession(`车机热点连接失败：${describeFailure(error)}`);
@@ -541,11 +672,13 @@ class CarPlaySessionController {
     if (!this.isCurrent(generation)) {
       return;
     }
-    this.setState('airplay-found');
+    if (this.state !== 'media-negotiating' && this.state !== 'waiting-video') {
+      this.setState('airplay-found');
+    }
     const pairingSupport = endpoint.homeKitPairingSupported === undefined ? '未知' :
       endpoint.homeKitPairingSupported ? '支持' : '不支持';
     this.appendLog(`已发现车机 AirPlay 端点 ${endpoint.name}；HomeKit 配对声明：${pairingSupport}。` +
-      'RTSP 配对等待车机邀请触发；媒体流和触摸回控尚未接入。');
+      '媒体配对等待车机邀请触发；发现服务不代表视频投屏成功。');
     this.latestAirPlayEndpoint = endpoint;
     this.tryPairAfterInvite(generation);
     this.probeAirPlayEndpoint(endpoint, generation);
@@ -574,8 +707,69 @@ class CarPlaySessionController {
     if (!this.isCurrent(generation) || this.wifiConnectionStarted) {
       return;
     }
-    this.wifiConnectionStarted = true;
-    void this.connectToAccessoryWifi(configuration, generation);
+    try {
+      const resolved = resolveSessionWifi(configuration, carPlaySettings.snapshot().settings, carPlaySettings.password());
+      if (resolved === undefined) {
+        throw new Error('自动和备用 Wi-Fi 配置均不可用。');
+      }
+      if (this.wifiFallbackTimer !== undefined) {
+        clearTimeout(this.wifiFallbackTimer);
+        this.wifiFallbackTimer = undefined;
+      }
+      this.wifiConnectionStarted = true;
+      void this.connectToAccessoryWifi(resolved, generation);
+    } catch (error) {
+      this.failSession(`Wi-Fi 配置不完整：${describeFailure(error)}`);
+    }
+  }
+
+  private armWifiFallback(generation: number): void {
+    if (!this.isCurrent(generation) || this.wifiConnectionStarted || this.wifiFallbackTimer !== undefined) {
+      return;
+    }
+    this.wifiFallbackTimer = setTimeout(() => {
+      this.wifiFallbackTimer = undefined;
+      if (!this.isCurrent(generation) || this.wifiConnectionStarted) {
+        return;
+      }
+      try {
+        const manual = resolveSessionWifi(undefined, carPlaySettings.snapshot().settings, carPlaySettings.password());
+        if (manual === undefined) {
+          this.appendLog('自动 Wi-Fi 配置尚未到达，且没有备用 SSID；继续等待 iAP2，或关闭开关后到设置补全。');
+          return;
+        }
+        this.appendLog('自动 Wi-Fi 信息等待超时；使用用户保存的备用网络配置，不跳过蓝牙/iAP2 协商。');
+        this.beginWifiConnection(manual, generation);
+      } catch (error) {
+        this.failSession(`备用 Wi-Fi 配置不可用：${describeFailure(error)}`);
+      }
+    }, 8000);
+  }
+
+  private armAirPlayFallback(generation: number): void {
+    this.airPlayFallbackTimer = setTimeout(() => {
+      this.airPlayFallbackTimer = undefined;
+      if (!this.isCurrent(generation) || this.selectAirPlayEndpoint(false) !== undefined) {
+        return;
+      }
+      this.manualEndpointAllowed = true;
+      const endpoint = this.selectAirPlayEndpoint(true);
+      if (endpoint !== undefined) {
+        this.appendLog('iAP2/mDNS 尚未提供有效端点；启用手动 AirPlay 备用地址，配对仍等待真实车机邀请。');
+        this.probeAirPlayEndpoint(endpoint, generation);
+        this.tryPairAfterInvite(generation);
+      }
+    }, 5000);
+  }
+
+  private selectAirPlayEndpoint(allowManual: boolean): AirPlayServiceEndpoint | undefined {
+    const start = this.pendingStartSession;
+    const host = start?.ipAddresses.find((value: string) => value.length > 0);
+    const direct: AirPlayServiceEndpoint | undefined = start !== undefined && host !== undefined ? {
+      name: 'iAP2 CarPlayStartSession', host, port: start.airPlayPort, features: undefined, homeKitPairingSupported: undefined
+    } : undefined;
+    return chooseAirPlayEndpoint(direct, this.latestAirPlayEndpoint,
+      configuredAirPlay(carPlaySettings.snapshot().settings), allowManual);
   }
 
   private probePendingStartSession(generation: number): void {
@@ -607,41 +801,60 @@ class CarPlaySessionController {
       (this.state !== 'wifi-connected' && this.state !== 'airplay-found')) {
       return;
     }
-    const startSession = this.pendingStartSession;
-    const directHost = startSession?.ipAddresses.find((host: string) => host.length > 0);
-    const endpoint: AirPlayServiceEndpoint | undefined = directHost !== undefined && startSession !== undefined
-      ? {
-        name: 'iAP2 CarPlayStartSession',
-        host: directHost,
-        port: startSession.airPlayPort,
-        features: undefined,
-        homeKitPairingSupported: undefined
-      }
-      : this.latestAirPlayEndpoint;
+    const endpoint = this.selectAirPlayEndpoint(this.manualEndpointAllowed);
     if (endpoint === undefined || endpoint.port < 1 || endpoint.port > 65535) {
       this.appendLog('已收到 CarPlay 邀请，但尚无可用 AirPlay RTSP 端点；等待 iAP2/mDNS 端点。');
       return;
     }
     this.pairingStarted = true;
-    this.appendLog(`收到车机邀请，开始 AirPlay HomeKit 配对与验证：${endpoint.host}:${endpoint.port}。`);
+    this.setState('media-negotiating');
+    this.appendLog(`收到车机邀请，开始 AirPlay 配对、验证和媒体通道协商：${endpoint.host}:${endpoint.port}。`);
     const context = this.abilityContext;
     if (context === undefined) {
       this.pairingStarted = false;
-      this.appendLog('无法启动 AirPlay 配对：应用上下文不可用。');
+      this.failSession('无法启动 AirPlay 媒体协商：应用上下文不可用。');
       return;
     }
-    void new HarmonyAirPlayClient().pairAndVerify(
+    const identity = this.realBluetoothAddress;
+    if (identity === undefined) {
+      this.pairingStarted = false;
+      this.blockSession('媒体 SETUP 需要稳定的本机蓝牙身份；当前会话没有可用身份。');
+      return;
+    }
+    const settings = carPlaySettings.snapshot().settings;
+    void HarmonyAirPlayMediaSession.establish(
       context,
       endpoint,
-      (message: string) => this.appendLog(message)
-    ).then(() => {
-      if (this.isCurrent(generation)) {
-        this.appendLog('AirPlay pair-setup/pair-verify 已完成；媒体 SETUP/RECORD 与帧源仍未建立。');
+      identity,
+      {
+        name: settings.deviceName,
+        model: deviceInfo.productModel,
+        osName: 'HarmonyOS',
+        osBuildVersion: deviceInfo.osFullName,
+        osVersion: `${deviceInfo.sdkApiVersion}`,
+        sourceVersion: 'CarPlayHarmonyClient/1.0'
+      },
+      (message: string) => this.appendLog(message),
+      () => this.isCurrent(generation),
+      (error: Error) => {
+        if (this.isCurrent(generation)) {
+          this.failSession(`AirPlay 媒体会话异常：${describeFailure(error)}`);
+        }
       }
-    }).catch((error: Error) => {
+    ).then((mediaSession: HarmonyAirPlayMediaSession) => {
+      if (!this.isCurrent(generation)) {
+        void mediaSession.close().catch((error: Error) => {
+          this.appendLog(`已取消媒体协商后的清理失败：${describeFailure(error)}`, true);
+        });
+        return;
+      }
+      this.airPlayMediaSession = mediaSession;
+      this.setState('waiting-video');
+      this.appendLog('AirPlay 配对、SETUP、RECORD 与视频数据通道已建立；尚未发送视频帧，当前不是投屏状态。');
+    }, (error: Error) => {
       if (this.isCurrent(generation)) {
         this.pairingStarted = false;
-        this.appendLog(`AirPlay 配对失败：${error.message}`);
+        this.failSession(`AirPlay 媒体协商失败：${describeFailure(error)}`);
       }
     });
   }

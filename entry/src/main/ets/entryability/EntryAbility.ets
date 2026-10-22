@@ -1,4 +1,4 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { carPlaySessionController } from '../app/session/CarPlaySessionController';
@@ -8,8 +8,13 @@ import { describeFailure } from '../platform/diagnostics/DiagnosticFormat';
 const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
+  private initialization: Promise<void> = Promise.resolve();
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    carPlaySessionController.setContext(this.context);
+    this.initialization = carPlaySessionController.setContext(this.context);
+    void this.initialization.catch((error: Error) => {
+      carPlayDiagnostics.log('ability', `配置初始化失败：${describeFailure(error)}`, true);
+    });
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }
 
@@ -29,13 +34,10 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
+      void this.initialization.then(() => carPlaySessionController.restoreEnabledOnce()).catch((error: Error) => {
+        carPlayDiagnostics.log('ability', `恢复开启状态失败：${describeFailure(error)}`, true);
+      });
     });
-
-    try {
-      this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
-    } catch (err) {
-      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
-    }
   }
 
   onWindowStageDestroy(): void {

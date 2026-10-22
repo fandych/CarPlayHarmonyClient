@@ -58,7 +58,8 @@ export class HarmonyAirPlayRtspSession {
       await this.client.connect({
         address: {
           address: endpoint.host,
-          port: endpoint.port
+          port: endpoint.port,
+          family: endpoint.host.includes(':') ? 2 : 1
         },
         timeout: REQUEST_TIMEOUT_MS
       });

@@ -14,6 +14,8 @@ import carPlayDiagnosticsTest from './CarPlayDiagnostics.test';
 import harmonySppClientTest from './HarmonySppClient.test';
 import harmonyWifiSelectionTest from './HarmonyWifiSelection.test';
 import harmonyBluetoothIdentityTest from './HarmonyBluetoothIdentity.test';
+import carPlaySettingsTest from './CarPlaySettings.test';
+import rtspEventMessageParserTest from './RtspEventMessageParser.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -32,4 +34,6 @@ export default function testsuite() {
   harmonySppClientTest();
   harmonyWifiSelectionTest();
   harmonyBluetoothIdentityTest();
+  carPlaySettingsTest();
+  rtspEventMessageParserTest();
 }

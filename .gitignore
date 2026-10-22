@@ -10,3 +10,11 @@
 /.clang-tidy
 **/.test
 /.appanalyzer
+/certs/
+/HARMONY.md
+/build-profile.json5
+/.codegenie
+*.p12
+*.p7b
+*.keystore
+*.jks

@@ -78,6 +78,9 @@ export class CarPlayDiagnostics {
 
   initialize(filesDir: string): void {
     if (this.directory.length > 0) {
+      if (this.file === undefined) {
+        this.beginSession();
+      }
       return;
     }
     this.directory = `${filesDir}/carplay-logs`;

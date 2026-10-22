@@ -1,326 +1,229 @@
 import { carPlaySessionController, CarPlaySessionState, isCarPlaySessionActive } from '../app/session/CarPlaySessionController';
-import { PairedAccessory } from '../platform/bluetooth/HarmonySppClient';
-import { describeFailure } from '../platform/diagnostics/DiagnosticFormat';
+import { CarPlayTheme } from '../app/settings/CarPlaySettings';
+import { carPlaySettings } from '../platform/settings/HarmonySettings';
+import { showPageError } from '../components/PageHeader';
 
 @Entry
 @Component
 struct Index {
-  @State private isCarPlayEnabled: boolean = false;
-  @State private sessionState: CarPlaySessionState = 'idle';
-  @State private logs: string[] = [];
-  @State private deviceOptions: SelectOption[] = [];
-  @State private selectedDeviceIndex: number = -1;
+  @State private state: CarPlaySessionState = 'idle';
+  @State private deviceName: string = '';
+  @State private carPlayEnabled: boolean = false;
+  @State private ready: boolean = false;
+  @State private busy: boolean = false;
+  @State private changingSwitch: boolean = false;
+  @State private theme: CarPlayTheme = 'system';
+  @State private settingsError: string = '';
   @State private blockedReason: string = '';
-  @State private logFailure: string = '';
-  @State private logOptions: SelectOption[] = [];
-  @State private selectedLogIndex: number = 0;
-  @State private exporting: boolean = false;
-  private devices: PairedAccessory[] = [];
-  private logNames: string[] = [];
-  private logSession: string = '';
-  private unsubscribe: (() => void) | undefined = undefined;
+  private unsubscribeSession: (() => void) | undefined = undefined;
+  private unsubscribeSettings: (() => void) | undefined = undefined;
 
   aboutToAppear(): void {
-    this.unsubscribe = carPlaySessionController.subscribe((snapshot) => {
-      this.sessionState = snapshot.state;
-      this.isCarPlayEnabled = isCarPlaySessionActive(snapshot.state);
-      this.logs = snapshot.logs;
-      this.devices = snapshot.devices;
-      this.deviceOptions = snapshot.devices.map((device: PairedAccessory): SelectOption => {
-        return { value: device.name };
-      });
-      this.selectedDeviceIndex = snapshot.devices.findIndex((device: PairedAccessory) =>
-        device.deviceId === snapshot.selectedDeviceId);
+    this.unsubscribeSession = carPlaySessionController.subscribe((snapshot) => {
+      this.state = snapshot.state;
+      this.deviceName = snapshot.connectedDeviceName;
       this.blockedReason = snapshot.blockedReason;
-      this.logFailure = snapshot.logFailure;
-      if (this.logSession !== snapshot.logSession) {
-        this.logSession = snapshot.logSession;
-        this.refreshLogSessions();
-      }
+    });
+    this.unsubscribeSettings = carPlaySettings.subscribe((snapshot) => {
+      this.carPlayEnabled = snapshot.settings.enabled;
+      this.ready = snapshot.ready;
+      this.busy = snapshot.busy;
+      this.theme = snapshot.settings.theme;
+      this.settingsError = snapshot.error;
     });
   }
 
-  private showFailure(stage: string, error: Error): void {
-    carPlaySessionController.reportActionFailure(stage, error);
-    this.getUIContext().getPromptAction().showToast({ message: `${stage}失败：${describeFailure(error)}` });
-  }
-
-  private refreshLogSessions(): void {
-    try {
-      this.logNames = carPlaySessionController.logSessions();
-      this.logOptions = this.logNames.map((name: string): SelectOption => {
-        return { value: `${name === this.logSession ? '当前 · ' : ''}${name}` };
-      });
-      this.selectedLogIndex = 0;
-    } catch (error) {
-      this.showFailure('读取日志列表', error);
-    }
-  }
-
-  private async refreshAccessories(): Promise<void> {
-    try {
-      await carPlaySessionController.refreshAccessories();
-    } catch (error) {
-      this.showFailure('刷新配对设备', error);
-    }
-  }
-
-  private async exportLog(): Promise<void> {
-    const name = this.logNames[this.selectedLogIndex];
-    if (name === undefined) {
-      this.getUIContext().getPromptAction().showToast({ message: '暂无可导出的日志文件。' });
-      return;
-    }
-    this.exporting = true;
-    try {
-      const saved = await carPlaySessionController.exportLogs(name);
-      this.getUIContext().getPromptAction().showToast({
-        message: saved ? '日志已保存；如有持久化错误，请检查不完整提示。' : '已取消保存日志。'
-      });
-    } catch (error) {
-      this.showFailure('导出日志', error);
-    } finally {
-      this.exporting = false;
-    }
-  }
-
   aboutToDisappear(): void {
-    if (this.unsubscribe !== undefined) {
-      this.unsubscribe();
-      this.unsubscribe = undefined;
-    }
+    this.unsubscribeSession?.();
+    this.unsubscribeSettings?.();
+    this.unsubscribeSession = undefined;
+    this.unsubscribeSettings = undefined;
   }
 
-  private onSwitchChanged(enabled: boolean): void {
-    if (enabled === isCarPlaySessionActive(this.sessionState)) {
+  private async changeEnabled(value: boolean): Promise<void> {
+    if (value === this.carPlayEnabled || this.changingSwitch) {
       return;
     }
-    this.isCarPlayEnabled = enabled;
-    if (enabled) {
-      void carPlaySessionController.start();
-    } else {
-      carPlaySessionController.stop();
+    this.changingSwitch = true;
+    try {
+      await carPlaySessionController.setEnabled(value);
+    } catch (error) {
+      showPageError(this.getUIContext(), '保存 CarPlay 开关', error);
+    } finally {
+      this.changingSwitch = false;
     }
   }
 
-  private statusLabel(): string {
-    switch (this.sessionState) {
-      case 'connecting':
-        return '正在连接所选接收端／等待回连';
-      case 'bluetooth-connected':
-        return '蓝牙通道已连接';
-      case 'iap2-negotiating':
-        return 'iAP2 链路协商中';
-      case 'iap2-ready':
-        return 'iAP2 链路已就绪 · CarPlay 尚未建立';
-      case 'wifi-pending':
-        return 'Wi-Fi 配置已收到 · CarPlay 尚未建立';
-      case 'wifi-connected':
-        return '车机热点已连接 · AirPlay 尚未建立';
-      case 'airplay-found':
-        return 'AirPlay 服务已发现 · CarPlay 尚未建立';
-      case 'error':
-        return '连接失败';
-      case 'blocked':
-        return '能力受限 · 无线 CarPlay 被阻塞';
-      default:
-        return '未连接';
+  private statusDetail(): string {
+    switch (this.state) {
+      case 'connecting': return '正在连接所选接收端，或等待接收端回连';
+      case 'bluetooth-connected': return '蓝牙通道已连接，CarPlay 尚未建立';
+      case 'iap2-negotiating': return '正在协商 iAP2 链路，CarPlay 尚未建立';
+      case 'iap2-ready': return 'iAP2 已就绪，等待车机网络信息';
+      case 'wifi-pending': return '正在确认并加入车机 Wi-Fi';
+      case 'wifi-connected': return '车机 Wi-Fi 已连接，等待邀请/端点';
+      case 'airplay-found': return '已发现 AirPlay 服务，尚未开始视频投屏';
+      case 'media-negotiating': return '正在进行 AirPlay 配对与媒体通道协商';
+      case 'waiting-video': return '媒体通道已建立，等待视频源；尚未投屏';
+      case 'screen-capture-pending': return '正在等待系统屏幕采集授权或首个 H.264 视频帧';
+      case 'streaming': return '屏幕采集已授权，正在向接收端发送视频帧';
+      case 'blocked': return this.blockedReason;
+      case 'error': return '连接失败，开启意图已保留；请查看日志或修改设置后重试';
+      default: return this.carPlayEnabled ? '已记住开启状态，当前未连接' : '开启后连接已保存的接收端';
     }
   }
 
-  private statusColor(): string {
-    switch (this.sessionState) {
-      case 'bluetooth-connected':
-        return '#F3B75F';
-      case 'connecting':
-        return '#77A9FF';
-      case 'error':
-        return '#FF7777';
-      case 'blocked':
-        return '#F3B75F';
-      default:
-        return '#8994A8';
+  @Builder
+  private menuRow(title: string, url: string, detail: string = '') {
+    Row({ space: 12 }) {
+      Text(title)
+        .fontSize(18)
+        .fontColor($r('app.color.primary_text'))
+      Blank()
+      if (detail.length > 0) {
+        Text(detail)
+          .fontSize(14)
+          .fontColor($r('app.color.secondary_text'))
+      }
+      Text('>')
+        .fontSize(20)
+        .fontColor($r('app.color.secondary_text'))
     }
+    .width('100%')
+    .height(64)
+    .padding({ left: 20, right: 20 })
+    .backgroundColor($r('app.color.card_background'))
+    .accessibilityText(title)
+    .onClick(() => {
+      void this.getUIContext().getRouter().pushUrl({ url }).catch((error: Error) => {
+        showPageError(this.getUIContext(), '打开页面', error);
+      });
+    })
   }
 
   build() {
-    Column({ space: 18 }) {
-      Column({ space: 8 }) {
-        Text('CARPLAY')
-          .fontSize(13)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#8FAEFF')
-          .letterSpacing(2)
-        Text('Harmony Client')
-          .fontSize(28)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#F4F6FB')
-        Text('无线连接控制台')
-          .fontSize(14)
-          .fontColor('#919CB0')
-      }
-      .alignItems(HorizontalAlign.Start)
-      .width('100%')
-
-      Column({ space: 8 }) {
-        Row() {
-          Text('已配对的接收端')
+    Scroll() {
+      Column({ space: 24 }) {
+        Column({ space: 5 }) {
+          Text('CarPlay')
+            .fontSize(34)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.primary_text'))
+          Text('Harmony 无线发送端')
             .fontSize(14)
-            .fontColor('#C2CBD9')
-          Blank()
-          Button('检测身份')
-            .fontSize(12)
-            .enabled(!this.isCarPlayEnabled)
-            .onClick(() => {
-              void carPlaySessionController.checkBluetoothIdentity().catch((error: Error) => {
-                this.showFailure('检测蓝牙身份', error);
+            .fontColor($r('app.color.secondary_text'))
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        Column({ space: 16 }) {
+          Row({ space: 12 }) {
+            Text('状态')
+              .fontSize(18)
+              .fontColor($r('app.color.primary_text'))
+            Blank()
+            Text(this.deviceName.length > 0 ? `${this.deviceName}（蓝牙已连接）` : '未连接')
+              .fontSize(15)
+              .fontColor($r('app.color.secondary_text'))
+              .maxLines(2)
+              .textAlign(TextAlign.End)
+              .layoutWeight(1)
+          }
+          Text(this.statusDetail())
+            .fontSize(13)
+            .fontColor(this.state === 'error' || this.state === 'blocked' ? $r('app.color.warning') : $r('app.color.secondary_text'))
+            .width('100%')
+          Divider().color($r('app.color.divider'))
+          Row() {
+            Column({ space: 5 }) {
+              Text('CarPlay')
+                .fontSize(18)
+                .fontColor($r('app.color.primary_text'))
+              Text('记住开关，重新打开应用时尝试恢复一次')
+                .fontSize(12)
+                .fontColor($r('app.color.secondary_text'))
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.carPlayEnabled })
+              .accessibilityText('CarPlay 开关')
+              .enabled(this.ready && !this.busy && !this.changingSwitch)
+              .onChange((value: boolean) => { void this.changeEnabled(value); })
+          }
+          if (this.carPlayEnabled && !isCarPlaySessionActive(this.state)) {
+            Button('重试连接')
+              .enabled(this.ready && !this.busy)
+              .onClick(() => {
+                void carPlaySessionController.start().catch((error: Error) => {
+                  showPageError(this.getUIContext(), '重试连接', error);
+                });
+              })
+          }
+          if (this.state === 'waiting-video') {
+            Text('开始后将投送手机当前屏幕（可能包含其他应用的可见内容）。系统会先请求授权；可随时停止。')
+              .fontSize(12)
+              .fontColor($r('app.color.secondary_text'))
+              .width('100%')
+            Button('开始投屏')
+              .enabled(!this.busy)
+              .width('100%')
+              .onClick(() => {
+                try {
+                  carPlaySessionController.startProjection();
+                } catch (error) {
+                  showPageError(this.getUIContext(), '开始投屏', error);
+                }
+              })
+          }
+          if (this.state === 'screen-capture-pending' || this.state === 'streaming') {
+            Button(this.state === 'streaming' ? '停止投屏' : '取消屏幕采集')
+              .enabled(!this.busy)
+              .width('100%')
+              .onClick(() => {
+                void carPlaySessionController.stopProjection().catch((error: Error) => {
+                  showPageError(this.getUIContext(), '停止投屏', error);
+                });
+              })
+          }
+        }
+        .padding(20)
+        .borderRadius(18)
+        .backgroundColor($r('app.color.card_background'))
+        .width('100%')
+
+        Column() {
+          this.menuRow('主题', 'pages/Theme', this.theme === 'system' ? '跟随系统' : this.theme === 'dark' ? '深色' : '浅色')
+          Divider().color($r('app.color.divider'))
+          this.menuRow('设置', 'pages/Settings')
+          Divider().color($r('app.color.divider'))
+          this.menuRow('日志', 'pages/Logs')
+          Divider().color($r('app.color.divider'))
+          this.menuRow('关于', 'pages/About')
+        }
+        .borderRadius(18)
+        .clip(true)
+        .width('100%')
+
+        if (!this.ready) {
+          Text(this.settingsError || '正在载入配置…')
+            .fontSize(13)
+            .fontColor($r('app.color.danger'))
+          if (this.settingsError.length > 0) {
+            Button('重新载入配置').onClick(() => {
+              void carPlaySettings.retryInitialization().catch((error: Error) => {
+                showPageError(this.getUIContext(), '载入配置', error);
               });
             })
-          Button('刷新')
-            .fontSize(12)
-            .enabled(!this.isCarPlayEnabled)
-            .onClick(() => { void this.refreshAccessories(); })
-        }
-        Select(this.deviceOptions)
-          .selected(this.selectedDeviceIndex)
-          .value(this.selectedDeviceIndex >= 0 ? this.deviceOptions[this.selectedDeviceIndex].value : '请刷新并选择车机或 DiPlay')
-          .fontColor('#C2CBD9')
-          .width('100%')
-          .enabled(!this.isCarPlayEnabled)
-          .onSelect((index: number) => {
-            try {
-              carPlaySessionController.selectAccessory(this.devices[index].deviceId);
-            } catch (error) {
-              this.showFailure('选择接收端', error);
-            }
-          })
-      }
-      .width('100%')
-
-      Row() {
-        Column({ space: 6 }) {
-          Text('CarPlay 连接')
-            .fontSize(17)
-            .fontWeight(FontWeight.Medium)
-            .fontColor('#F4F6FB')
-          Text('只连接所选设备，同时支持接收端回连')
-            .fontSize(13)
-            .fontColor('#919CB0')
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.isCarPlayEnabled })
-          .accessibilityText('CarPlay 连接开关')
-          .onChange((value: boolean) => this.onSwitchChanged(value))
-      }
-      .width('100%')
-      .padding(18)
-      .backgroundColor('#151E2D')
-      .borderRadius(18)
-
-      Column({ space: 12 }) {
-        Text('连接状态')
-          .fontSize(13)
-          .fontColor('#919CB0')
-        Row({ space: 9 }) {
-          Circle()
-            .width(9)
-            .height(9)
-            .fill(this.statusColor())
-          Text(this.statusLabel())
-            .fontSize(16)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(this.statusColor())
-        }
-        .width('100%')
-        if (this.blockedReason.length > 0) {
-          Text(this.blockedReason)
-            .fontSize(12)
-            .fontColor('#F3B75F')
-            .width('100%')
-        }
-      }
-      .alignItems(HorizontalAlign.Start)
-      .width('100%')
-      .padding(18)
-      .backgroundColor('#151E2D')
-      .borderRadius(18)
-
-      Column({ space: 12 }) {
-        Row() {
-          Text('运行日志')
-            .fontSize(15)
-            .fontWeight(FontWeight.Medium)
-            .fontColor('#F4F6FB')
-          Blank()
-          Text(`${this.logs.length} 条`)
-            .fontSize(12)
-            .fontColor('#8994A8')
-        }
-        .width('100%')
-
-        Row({ space: 8 }) {
-          Select(this.logOptions)
-            .selected(this.selectedLogIndex)
-            .value(this.logOptions[this.selectedLogIndex]?.value ?? '暂无日志')
-            .font({ size: 11 })
-            .fontColor('#C2CBD9')
-            .layoutWeight(1)
-            .enabled(!this.exporting)
-            .onSelect((index: number) => { this.selectedLogIndex = index; })
-          Button(this.exporting ? '保存中' : '导出')
-            .fontSize(12)
-            .enabled(!this.exporting && this.logNames.length > 0)
-            .onClick(() => { void this.exportLog(); })
-          Button('刷新')
-            .fontSize(12)
-            .enabled(!this.exporting)
-            .onClick(() => this.refreshLogSessions())
-        }
-        .width('100%')
-        Text('界面仅显示最近 250 条；导出读取完整文件，保留最近 10 次会话。')
-          .fontSize(11)
-          .fontColor('#8994A8')
-        if (this.logFailure.length > 0) {
-          Text(`日志存储失败，文件可能不完整：${this.logFailure}`)
-            .fontSize(12)
-            .fontColor('#FF7777')
-        }
-
-        Scroll() {
-          Column({ space: 8 }) {
-            if (this.logs.length === 0) {
-              Text('开启连接后，运行状态和错误信息会显示在这里。')
-                .fontSize(13)
-                .fontColor('#8994A8')
-                .width('100%')
-            } else {
-              ForEach(this.logs, (line: string, index: number) => {
-                Text(line)
-                  .fontSize(12)
-                  .fontColor('#C2CBD9')
-                  .width('100%')
-                  .textAlign(TextAlign.Start)
-              }, (line: string, index: number) => `${index}-${line}`)
-            }
           }
-          .width('100%')
-          .alignItems(HorizontalAlign.Start)
+        } else if (this.settingsError.length > 0) {
+          Text(this.settingsError).fontColor($r('app.color.danger')).fontSize(13)
         }
-        .layoutWeight(1)
-        .width('100%')
-        .scrollBar(BarState.Auto)
       }
-      .layoutWeight(1)
       .width('100%')
-      .padding(18)
-      .backgroundColor('#151E2D')
-      .borderRadius(18)
+      .padding({ left: 24, right: 24, top: 28, bottom: 20 })
     }
     .width('100%')
     .height('100%')
-    .padding({ left: 22, right: 22, top: 28, bottom: 20 })
-    .backgroundColor('#0B111C')
+    .backgroundColor($r('app.color.page_background'))
   }
 }

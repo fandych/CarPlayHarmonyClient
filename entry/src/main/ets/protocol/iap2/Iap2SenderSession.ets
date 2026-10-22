@@ -66,6 +66,8 @@ export class Iap2SenderSession {
   private readonly onEndpoint: EndpointListener | undefined;
   private readonly onBlocked: ((reason: string) => void) | undefined;
   private readonly realBluetoothAddress: string | undefined;
+  private readonly deviceName: string;
+  private readonly onWifiPending: (() => void) | undefined;
   private availabilitySent: boolean = false;
   private accessorySendMessageIds: Set<number> | undefined = undefined;
   private accessoryReceiveMessageIds: Set<number> | undefined = undefined;
@@ -76,7 +78,9 @@ export class Iap2SenderSession {
     onWifiConfiguration: WifiConfigurationListener,
     onEndpoint?: EndpointListener,
     onBlocked?: (reason: string) => void,
-    realBluetoothAddress?: string
+    realBluetoothAddress?: string,
+    deviceName: string = 'Harmony CarPlay',
+    onWifiPending?: () => void
   ) {
     this.sendControl = sendControl;
     this.log = log;
@@ -85,6 +89,11 @@ export class Iap2SenderSession {
     this.onBlocked = onBlocked;
     this.realBluetoothAddress = realBluetoothAddress === undefined ? undefined :
       CarPlayInviteProtocol.createTxtIdentity(realBluetoothAddress).toUpperCase();
+    if (deviceName.trim().length === 0 || /[\x00-\x1F]/.test(deviceName)) {
+      throw new Error('iAP2 设备名不能为空或包含控制字符。');
+    }
+    this.deviceName = deviceName;
+    this.onWifiPending = onWifiPending;
   }
 
   start(): void {
@@ -237,6 +246,7 @@ export class Iap2SenderSession {
     this.log(reason);
     this.sendMessage(MFI_AUTHENTICATION_SUCCEEDED);
     this.log('已发送 MFi 发送端成功标记。');
+    this.onWifiPending?.();
     const canReceiveWifiRequest = this.accessoryReceiveMessageIds?.has(REQUEST_ACCESSORY_WIFI_CONFIGURATION);
     const canSendWifiConfiguration = this.accessorySendMessageIds?.has(ACCESSORY_WIFI_CONFIGURATION);
     if (canReceiveWifiRequest !== false && canSendWifiConfiguration !== false) {
@@ -255,12 +265,15 @@ export class Iap2SenderSession {
     }
     const address = this.realBluetoothAddress;
     if (address === undefined) {
-      const reason = '新版 0x4300/邀请服务需要本机真实蓝牙身份；access.getLocalAddress 系统接口与权限检查尚未通过。';
+      const reason = '新版 0x4300/邀请服务需要本机真实蓝牙身份；自动读取不可用且尚未配置合法的手动备用地址。';
       this.log(reason);
       this.onBlocked?.(reason);
       return;
     }
     this.availabilitySent = true;
+    if (this.accessoryReceiveMessageIds?.has(0x4E09) !== false) {
+      this.sendMessage(0x4E09, Iap2Csm.string(0, this.deviceName));
+    }
     if (this.accessoryReceiveMessageIds?.has(CARPLAY_AVAILABILITY) === false) {
       this.log('车机能力清单排除了 0x4300；不发送未声明支持的新版请求，端点等待 iAP2/mDNS。');
       return;

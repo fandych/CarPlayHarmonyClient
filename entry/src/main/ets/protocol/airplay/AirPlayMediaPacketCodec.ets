@@ -4,6 +4,15 @@ export interface AirPlayMediaCipher {
   seal(key: Uint8Array, nonce: Uint8Array, plaintext: Uint8Array, aad: Uint8Array): Promise<Uint8Array>;
 }
 
+export interface AirPlayMediaKeyDeriver {
+  derive(inputKeyMaterial: Uint8Array, salt: Uint8Array, info: Uint8Array): Promise<Uint8Array>;
+}
+
+export interface AirPlayMediaKeyParameters {
+  salt: Uint8Array;
+  info: Uint8Array;
+}
+
 export class HarmonyAirPlayMediaCipher implements AirPlayMediaCipher {
   seal(key: Uint8Array, nonce: Uint8Array, plaintext: Uint8Array, aad: Uint8Array): Promise<Uint8Array> {
     return HarmonyAirPlayCrypto.chachaSeal(key, nonce, plaintext, aad);
@@ -52,7 +61,73 @@ export class AirPlayMediaPacketCodec {
     return units;
   }
 
+  static normalizeAnnexB(bytes: Uint8Array): Uint8Array {
+    if (bytes.length === 0) {
+      throw new Error('H.264 encoded data cannot be empty.');
+    }
+    if (AirPlayMediaPacketCodec.hasAnnexBStartCode(bytes)) {
+      return bytes.slice();
+    }
+    const lengthPrefixed = AirPlayMediaPacketCodec.tryLengthPrefixed(bytes, 4) ??
+      AirPlayMediaPacketCodec.tryLengthPrefixed(bytes, 2) ??
+      AirPlayMediaPacketCodec.tryLengthPrefixed(bytes, 1);
+    if (lengthPrefixed !== undefined) {
+      return AirPlayMediaPacketCodec.concat(...lengthPrefixed.map((unit: Uint8Array) =>
+        AirPlayMediaPacketCodec.concat(new Uint8Array([0, 0, 0, 1]), unit)));
+    }
+    const nalType = bytes[0] & 0x1F;
+    if (nalType >= 1 && nalType <= 23) {
+      return AirPlayMediaPacketCodec.concat(new Uint8Array([0, 0, 0, 1]), bytes);
+    }
+    throw new Error('Unsupported H.264 NAL framing from the screen encoder.');
+  }
+
+  static isAvcConfigurationRecord(bytes: Uint8Array): boolean {
+    if (bytes.length < 7 || bytes[0] !== 1 || (bytes[4] & 0xFC) !== 0xFC ||
+      (bytes[5] & 0xE0) !== 0xE0) {
+      return false;
+    }
+    let offset = 6;
+    const sequenceCount = bytes[5] & 0x1F;
+    if (sequenceCount === 0) {
+      return false;
+    }
+    for (let index = 0; index < sequenceCount; index++) {
+      if (offset + 2 > bytes.length) {
+        return false;
+      }
+      const length = AirPlayMediaPacketCodec.readU16Be(bytes, offset);
+      offset += 2;
+      if (length === 0 || length > bytes.length - offset || (bytes[offset] & 0x1F) !== 7) {
+        return false;
+      }
+      offset += length;
+    }
+    if (offset >= bytes.length) {
+      return false;
+    }
+    const pictureCount = bytes[offset++];
+    if (pictureCount === 0) {
+      return false;
+    }
+    for (let index = 0; index < pictureCount; index++) {
+      if (offset + 2 > bytes.length) {
+        return false;
+      }
+      const length = AirPlayMediaPacketCodec.readU16Be(bytes, offset);
+      offset += 2;
+      if (length === 0 || length > bytes.length - offset || (bytes[offset] & 0x1F) !== 8) {
+        return false;
+      }
+      offset += length;
+    }
+    return true;
+  }
+
   static buildAvcC(annexB: Uint8Array): Uint8Array {
+    if (AirPlayMediaPacketCodec.isAvcConfigurationRecord(annexB)) {
+      return annexB.slice();
+    }
     const units = AirPlayMediaPacketCodec.splitAnnexB(annexB);
     const sps = units.find((unit: Uint8Array) => unit.length > 0 && (unit[0] & 0x1F) === 7);
     const pps = units.find((unit: Uint8Array) => unit.length > 0 && (unit[0] & 0x1F) === 8);
@@ -105,6 +180,27 @@ export class AirPlayMediaPacketCodec {
     return AirPlayMediaPacketCodec.concat(header, statsBody);
   }
 
+  static deriveVideoStreamKey(
+    sharedSecret: Uint8Array,
+    streamConnectionId: number,
+    deriver?: AirPlayMediaKeyDeriver
+  ): Promise<Uint8Array> {
+    const parameters = AirPlayMediaPacketCodec.videoStreamKeyParameters(streamConnectionId);
+    return deriver === undefined
+      ? HarmonyAirPlayCrypto.hkdfSha512(sharedSecret, parameters.salt, parameters.info)
+      : deriver.derive(sharedSecret, parameters.salt, parameters.info);
+  }
+
+  static videoStreamKeyParameters(streamConnectionId: number): AirPlayMediaKeyParameters {
+    if (!Number.isSafeInteger(streamConnectionId) || streamConnectionId <= 0) {
+      throw new Error('AirPlay stream connection ID must be a positive safe integer.');
+    }
+    return {
+      salt: AirPlayMediaPacketCodec.ascii(`DataStream-Salt${streamConnectionId}`),
+      info: AirPlayMediaPacketCodec.ascii('DataStream-Output-Encryption-Key')
+    };
+  }
+
   static async sealVideoFrame(
     annexB: Uint8Array,
     key: Uint8Array,
@@ -125,12 +221,17 @@ export class AirPlayMediaPacketCodec {
     AirPlayMediaPacketCodec.writeU32Le(header, 0, plain.length + AirPlayMediaPacketCodec.CHACHA_TAG_SIZE);
     header[4] = AirPlayMediaPacketCodec.VIDEO_FRAME_OPCODE;
     header.set(ntpTimestampLittleEndian, 8);
-    const sealed = await cipher.seal(
-      key,
-      HarmonyAirPlayCrypto.nonceCounter(frameCounter),
-      plain,
-      header
-    );
+    let sealed = new Uint8Array(0);
+    try {
+      sealed = await cipher.seal(
+        key,
+        HarmonyAirPlayCrypto.nonceCounter(frameCounter),
+        plain,
+        header
+      );
+    } finally {
+      plain.fill(0);
+    }
     if (sealed.length !== plain.length + AirPlayMediaPacketCodec.CHACHA_TAG_SIZE) {
       throw new Error('ChaCha20-Poly1305 returned an invalid video frame length.');
     }
@@ -228,6 +329,29 @@ export class AirPlayMediaPacketCodec {
     }
   }
 
+  private static hasAnnexBStartCode(bytes: Uint8Array): boolean {
+    return (bytes.length >= 4 && bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 0 && bytes[3] === 1) ||
+      (bytes.length >= 3 && bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1);
+  }
+
+  private static tryLengthPrefixed(bytes: Uint8Array, lengthSize: number): Uint8Array[] | undefined {
+    const units: Uint8Array[] = [];
+    let offset = 0;
+    while (offset + lengthSize <= bytes.length) {
+      let length = 0;
+      for (let index = 0; index < lengthSize; index++) {
+        length = (length * 256) + bytes[offset + index];
+      }
+      offset += lengthSize;
+      if (length <= 0 || length > bytes.length - offset) {
+        return undefined;
+      }
+      units.push(bytes.slice(offset, offset + length));
+      offset += length;
+    }
+    return offset === bytes.length && units.length > 0 ? units : undefined;
+  }
+
   private static requireUnsigned(value: number, bits: number, label: string): void {
     if (!Number.isInteger(value) || value < 0 || value >= Math.pow(2, bits)) {
       throw new Error(`${label} is out of range.`);
@@ -247,6 +371,10 @@ export class AirPlayMediaPacketCodec {
     bytes[offset + 3] = Math.floor(value / 0x1000000) & 0xFF;
   }
 
+  private static readU16Be(bytes: Uint8Array, offset: number): number {
+    return (bytes[offset] << 8) | bytes[offset + 1];
+  }
+
   private static writeU32Be(bytes: Uint8Array, offset: number, value: number): void {
     bytes[offset] = Math.floor(value / 0x1000000) & 0xFF;
     bytes[offset + 1] = (value >>> 16) & 0xFF;
@@ -264,5 +392,17 @@ export class AirPlayMediaPacketCodec {
       offset += array.length;
     });
     return output;
+  }
+
+  private static ascii(value: string): Uint8Array {
+    const bytes = new Uint8Array(value.length);
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      if (code > 0x7F) {
+        throw new Error('AirPlay HKDF labels must use ASCII.');
+      }
+      bytes[index] = code;
+    }
+    return bytes;
   }
 }

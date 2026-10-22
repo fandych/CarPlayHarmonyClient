@@ -100,6 +100,15 @@ export class AirPlayControlCipher {
     return AirPlayControlCipher.concat(...plaintextFrames);
   }
 
+  clearSecrets(): void {
+    this.readKey.fill(0);
+    this.writeKey.fill(0);
+    this.readBuffer.fill(0);
+    this.readBuffer = new Uint8Array(0);
+    this.readCounter = 0;
+    this.writeCounter = 0;
+  }
+
   private static concat(...values: Uint8Array[]): Uint8Array {
     let length = 0;
     values.forEach((value: Uint8Array) => length += value.length);

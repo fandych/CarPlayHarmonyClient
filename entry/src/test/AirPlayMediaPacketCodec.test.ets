@@ -19,6 +19,14 @@ class DeterministicMediaCipher implements AirPlayMediaCipher {
   }
 }
 
+function asciiBytes(value: string): Uint8Array {
+  const bytes = new Uint8Array(value.length);
+  for (let index = 0; index < value.length; index++) {
+    bytes[index] = value.charCodeAt(index);
+  }
+  return bytes;
+}
+
 export default function airPlayMediaPacketCodecTest(): void {
   describe('AirPlay media packet codec', () => {
     it('builds H.264 avcC and the 128-byte encrypted video config header', 0, () => {
@@ -42,6 +50,45 @@ export default function airPlayMediaPacketCodecTest(): void {
       expect(packet[18]).assertEqual(0xF0);
       expect(packet[19]).assertEqual(0x44);
       expect(packet[23]).assertEqual(0x44);
+    });
+
+    it('normalizes length-prefixed encoder output to Annex-B and preserves avcC records', 0, () => {
+      const lengthPrefixed = new Uint8Array([
+        0, 0, 0, 3, 0x65, 0xAA, 0xBB,
+        0, 0, 0, 2, 0x41, 0xCC
+      ]);
+      const normalized = AirPlayMediaPacketCodec.normalizeAnnexB(lengthPrefixed);
+      expect(Array.from(normalized).join(',')).assertEqual(
+        '0,0,0,1,101,170,187,0,0,0,1,65,204'
+      );
+      const parameterSets = new Uint8Array([
+        0, 0, 0, 1, 0x67, 0x42, 0, 0x1E,
+        0, 0, 1, 0x68, 0xAA
+      ]);
+      const avcC = AirPlayMediaPacketCodec.buildAvcC(parameterSets);
+      expect(AirPlayMediaPacketCodec.isAvcConfigurationRecord(avcC)).assertTrue();
+      expect(Array.from(AirPlayMediaPacketCodec.buildAvcC(avcC)).join(','))
+        .assertEqual(Array.from(avcC).join(','));
+    });
+
+    it('builds an unencrypted 128-byte video keep-alive packet', 0, () => {
+      const packet = AirPlayMediaPacketCodec.buildKeepAlivePacket();
+      expect(packet.length).assertEqual(AirPlayMediaPacketCodec.VIDEO_HEADER_SIZE);
+      expect(packet[0]).assertEqual(0);
+      expect(packet[1]).assertEqual(0);
+      expect(packet[2]).assertEqual(0);
+      expect(packet[3]).assertEqual(0);
+      expect(packet[4]).assertEqual(AirPlayMediaPacketCodec.VIDEO_KEEPALIVE_OPCODE);
+    });
+
+    it('binds the video stream key parameters to the negotiated connection ID', 0, () => {
+      const parameters = AirPlayMediaPacketCodec.videoStreamKeyParameters(123456789);
+      expect(Array.from(parameters.salt).join(',')).assertEqual(
+        Array.from(asciiBytes('DataStream-Salt123456789')).join(',')
+      );
+      expect(Array.from(parameters.info).join(',')).assertEqual(
+        Array.from(asciiBytes('DataStream-Output-Encryption-Key')).join(',')
+      );
     });
 
     it('seals video frames with the 128-byte header as AAD and counter nonce', 0, async () => {

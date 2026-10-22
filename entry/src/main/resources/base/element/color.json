@@ -3,6 +3,14 @@
     {
       "name": "start_window_background",
       "value": "#FFFFFF"
-    }
+    },
+    { "name": "page_background", "value": "#F3F5F8" },
+    { "name": "card_background", "value": "#FFFFFF" },
+    { "name": "primary_text", "value": "#172033" },
+    { "name": "secondary_text", "value": "#59667C" },
+    { "name": "accent", "value": "#235DCE" },
+    { "name": "divider", "value": "#E3E8F0" },
+    { "name": "warning", "value": "#8B5700" },
+    { "name": "danger", "value": "#B3261E" }
   ]
 }

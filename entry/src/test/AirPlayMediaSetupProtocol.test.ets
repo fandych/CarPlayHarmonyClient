@@ -1,18 +1,32 @@
 import { describe, it, expect } from '@ohos/hypium';
-import { AirPlayMediaSetupProtocol } from '../main/ets/protocol/airplay/AirPlayMediaSetupProtocol';
+import {
+  AirPlayMediaSetupProtocol,
+  AirPlaySenderMetadata
+} from '../main/ets/protocol/airplay/AirPlayMediaSetupProtocol';
 import { BinaryPlist, BinaryPlistValue } from '../main/ets/protocol/airplay/BinaryPlist';
 
 export default function airPlayMediaSetupProtocolTest(): void {
   describe('AirPlay media SETUP/RECORD protocol', () => {
     it('builds session and screen setup plists using a real Bluetooth identity', 0, () => {
+      const sender: AirPlaySenderMetadata = {
+        name: 'Harmony CarPlay Sender',
+        model: 'PLR-AL00',
+        osName: 'HarmonyOS',
+        osBuildVersion: 'OpenHarmony-7.0.0',
+        osVersion: '26',
+        sourceVersion: 'CarPlayHarmonyClient/1.0'
+      };
       const initial = BinaryPlist.parse(AirPlayMediaSetupProtocol.buildInitialSetupBody(
         'A1:B2:C3:D4:E5:F6',
         49152,
         '12345678-1234-4ABC-8DEF-123456789ABC',
-        '87654321-4321-4CBA-8FED-CBA987654321'
+        '87654321-4321-4CBA-8FED-CBA987654321',
+        sender
       )) as Map<string, BinaryPlistValue>;
       expect(initial.get('deviceID') as string).assertEqual('A1:B2:C3:D4:E5:F6');
       expect(initial.get('macAddress') as string).assertEqual('A1:B2:C3:D4:E5:F6');
+      expect(initial.get('name') as string).assertEqual(sender.name);
+      expect(initial.get('model') as string).assertEqual(sender.model);
       expect(initial.get('timingPort') as number).assertEqual(49152);
       expect((initial.get('features') as BinaryPlistValue[]).length).assertEqual(14);
 
@@ -31,7 +45,8 @@ export default function airPlayMediaSetupProtocolTest(): void {
           '02:00:00:00:00:00',
           49152,
           '12345678-1234-4ABC-8DEF-123456789ABC',
-          '87654321-4321-4CBA-8FED-CBA987654321'
+          '87654321-4321-4CBA-8FED-CBA987654321',
+          sender
         );
       } catch {
         placeholderRejected = true;

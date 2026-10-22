@@ -11,6 +11,15 @@ export interface AudioMediaSetupParameters {
   samplesPerFrame?: number;
 }
 
+export interface AirPlaySenderMetadata {
+  name: string;
+  model: string;
+  osName: string;
+  osBuildVersion: string;
+  osVersion: string;
+  sourceVersion: string;
+}
+
 export class AirPlayMediaStreamPorts {
   readonly streamType: number;
   readonly dataPort: number;
@@ -41,13 +50,12 @@ export class AirPlayMediaSetupProtocol {
   static readonly SCREEN_STREAM_TYPE: number = 110;
   static readonly PCM_AUDIO_STREAM_TYPE: number = 100;
   static readonly HIGH_QUALITY_AUDIO_STREAM_TYPE: number = 102;
-  static readonly SENDER_SOURCE_VERSION: string = '566.25.21';
-
   static buildInitialSetupBody(
     realBluetoothAddress: string,
     timingPort: number,
     sessionUuid: string,
     correlationUuid: string,
+    sender: AirPlaySenderMetadata,
     encrypted: boolean = true
   ): Uint8Array {
     const identity = CarPlayInviteProtocol.createTxtIdentity(realBluetoothAddress);
@@ -57,15 +65,16 @@ export class AirPlayMediaSetupProtocol {
     if (sessionUuid.toLowerCase() === correlationUuid.toLowerCase()) {
       throw new Error('AirPlay session and correlation UUIDs must be distinct.');
     }
+    AirPlayMediaSetupProtocol.requireSenderMetadata(sender);
     const fields: Map<string, BinaryPlistValue> = new Map<string, BinaryPlistValue>();
     fields.set('deviceID', identity);
     fields.set('macAddress', identity);
-    fields.set('name', 'iPhone');
-    fields.set('model', 'iPhone14,2');
-    fields.set('osName', 'iPhone OS');
-    fields.set('osBuildVersion', '19A404');
-    fields.set('osVersion', '15.0.2');
-    fields.set('sourceVersion', AirPlayMediaSetupProtocol.SENDER_SOURCE_VERSION);
+    fields.set('name', sender.name);
+    fields.set('model', sender.model);
+    fields.set('osName', sender.osName);
+    fields.set('osBuildVersion', sender.osBuildVersion);
+    fields.set('osVersion', sender.osVersion);
+    fields.set('sourceVersion', sender.sourceVersion);
     fields.set('timingPort', timingPort);
     fields.set('sessionUUID', sessionUuid.toUpperCase());
     fields.set('sessionCorrelationUUID', correlationUuid.toUpperCase());
@@ -201,6 +210,20 @@ export class AirPlayMediaSetupProtocol {
   private static requirePort(port: number, label: string): void {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error(`${label} must be between 1 and 65535.`);
+    }
+  }
+
+  private static requireSenderMetadata(sender: AirPlaySenderMetadata): void {
+    const values: string[] = [
+      sender.name,
+      sender.model,
+      sender.osName,
+      sender.osBuildVersion,
+      sender.osVersion,
+      sender.sourceVersion
+    ];
+    if (values.some((value: string) => value.trim().length === 0 || value.length > 128)) {
+      throw new Error('AirPlay sender metadata contains a missing or oversized value.');
     }
   }
 
