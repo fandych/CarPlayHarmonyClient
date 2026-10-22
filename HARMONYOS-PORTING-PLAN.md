@@ -20,16 +20,19 @@
 
 当前工程仍处于传输层 POC 阶段，不是完整可用的 CarPlay 客户端：
 
-- 启动器名称与主页品牌为 CarPlayer。主页包含连接状态、记住开启意图的 CarPlay 开关和设备行；设备行的“连接”启动所选目标，右侧入口打开已配对设备选择器。只连接用户选择的设备，同时主动连接车机 `…caff` 服务并监听手机 `…cafe` 服务等待 DiPlay 回连，首个有效连接接管会话，取消后的迟到 socket 会关闭。状态区分蓝牙通道和真正投屏，失败保留系统错误码。
+- 启动器名称与主页品牌为 CarPlayer。主页包含连接状态、记住开启意图的 CarPlay 开关和设备行；启动后手机以安全 RFCOMM 服务监听 `…cafe` UUID，等待车机主动连接，首个有效会话接管连接；不再由手机拨号或要求预选目标。已配对设备选择器保留为可选设备管理入口。状态区分蓝牙通道和真正投屏，失败保留系统错误码。
 - 日志在 Ability 初始化时持久化，UI 仅缓存最近 250 条，文件保留最近 10 次完整会话；可导出当前或历史会话的一致快照。密码、密钥、地址及已注册的设备标识会脱敏，不记录媒体内容；持久化或导出失败有显式提示。开发工具入口为 `tools/Export-CarPlayLogs.ps1`，受调试包沙箱访问权限约束。
-- iAP2 sender 只在 link engine 完成 SYN/ACK 同步后启动；它回送 `0x1D02` 并请求 MFi 证书，要求 AA01 含可解析证书链，先执行系统 CA/PKIX、有效期和数字签名用途校验，再发送随机 challenge。仅在无法建立 issuer 信任链时展示主体、颁发者和 SHA-256 指纹供用户明确确认；精确叶证书指纹只在 MFi challenge 签名验证成功后保存在本机。证书过期、用途错误、用户拒绝、缺少 challenge/签名或签名不匹配都会拒绝会话，不发送 AA05，不继续 Wi-Fi/CarPlay 消息。MFi challenge 按接收端类型尝试 20/32/16 或 32/20/16 字节，拒绝或超时耗尽后失败，不伪造认证成功。身份阶段和 MFi 校验阶段在状态与日志中区分。认证成功后才按 `0x1D01` 收发消息能力清单请求旧版 `0x5702/0x5703` Wi-Fi 配置或发送新版 `0x4300`；对 `0x6800 StartHID` 会回 `0x6801`。已接入系统身份读取结果：合法地址用于新版 `0x4300` 和收到 `0x4301` 后的 `0x4E0E`，地址不可用则明确阻塞，绝不伪造。
+- iAP2 链路握手沿用 main 分支的流程：手机发送同步包，收到车机 SYN 后回送带原协商参数的 SYN-ACK（将 `maxOutgoing` 置为 `0x7F`），随后启动身份识别并请求 MFi 证书。AA01 必须含可解析证书链；先执行系统 CA/PKIX 校验，再发送随机 challenge。PKIX 验证失败时展示主体、颁发者、SHA-256 指纹和原因，用户可拒绝、仅对当前连接信任或始终信任；用户同意可覆盖该可解析证书的 PKIX 错误（包括有效期和数字签名用途），但 MFi challenge 签名仍必须验证成功。仅“始终”在签名验证成功后将精确叶证书指纹保存在本机；无法解析的证书、用户拒绝、缺少 challenge/签名或签名不匹配都会拒绝会话，不发送 AA05，不继续 Wi-Fi/CarPlay 消息。MFi challenge 按接收端类型尝试 20/32/16 或 32/20/16 字节，拒绝或超时耗尽后失败，不伪造认证成功。身份阶段和 MFi 校验阶段在状态与日志中区分。认证成功后才按 `0x1D01` 收发消息能力清单请求旧版 `0x5702/0x5703` Wi-Fi 配置或发送新版 `0x4300`；对 `0x6800 StartHID` 会回 `0x6801`。已接入系统身份读取结果：合法地址用于新版 `0x4300` 和收到 `0x4301` 后的 `0x4E0E`，地址不可用则明确阻塞，绝不伪造。
 - 新增 Binary Plist 解析器和 RTSP 响应分帧器；发现 AirPlay 端点后会发起一次 `/info` 能力查询。该查询只是连通性/协议探测，不代表建立 CarPlay 媒体会话。
 - `_airplay._tcp` 解析现保留 TXT `features` 位图并识别 HomeKit 配对能力 bit 38；TXT 缺失、重复或格式异常时标记为未知，避免错误降级为“不支持”。RTSP HomeKit 配对只由收到车机邀请后触发，不因单纯发现 AirPlay 服务而自动启动。
 - AirPlay 配对现有 SRP-6a、HomeKit pair-setup M1/M3/M5、pair-verify、HUKS Ed25519 控制器身份及持久 RTSP 连接传输实现。配件公钥/ID 会按端点地址保存，并由 HUKS 控制器身份签名校验；已有记录时走 pair-verify 快路径。pair-verify 后会在同一 RTSP 连接启用控制加密；普通 `pairAndVerify` 仍会在返回配对结果后关闭连接，媒体流程则使用可管理的 verified-session 保留连接。普通 phone 应用当前无法自动读取真实蓝牙地址；仅在用户配置本人真实地址后才可发布邀请服务，尚未用真车验证该路径。
 - 已加入严格 TLV8 编解码，包含 255 字节分片合并、重复字段分隔和截断输入拒绝，并接入 pair-setup/pair-verify 状态机。SRP、TLV 和配对目前只有协议/构建测试，HUKS 运行行为与真实接收端密钥编码仍需真机验证。
 - 新增 `_carplay-ctrl._tcp` mDNS/TCP 邀请服务与 `/ctrl-int/1/connect` HTTP 请求处理；TXT `id` 只接受合法的蓝牙地址。`ConfiguredBluetoothIdentityProvider` 优先调用带权限检查的系统 provider，无法读取时才使用用户保存的本人手机真实地址；拒绝零值、占位值和会话中途身份变化。手动来源会明确记录，不能宣称普通应用已自动核验地址所有权。
 - 车机 Wi-Fi 绑定不再直接使用 `getDefaultNet()`：等待目标 SSID 关联、唯一 WLAN 句柄和接口地址，绑定后再次核验；多 WLAN 无法唯一确认时拒绝猜测。停止时等待在途操作结束，分别清理候选配置、恢复原应用网络绑定并报告错误。
-- 新增媒体 wire codec：H.264 Annex-B/长度前缀 NAL 归一化、avcC 配置、128 字节屏幕流配置/帧/keepalive 封装、帧 ChaCha AAD/nonce，以及大端 PCM RTP/ChaCha 封包；有协议单测。视频流密钥按 `DataStream-Salt<streamConnectionID>` / `DataStream-Output-Encryption-Key` 从 pair-verify shared secret 派生，只在内存使用并在会话关闭时清零。收到车机邀请后，通过同一加密 RTSP 连接执行 `/info`、初始 SETUP、屏幕 SETUP、视频 TCP 数据口连接和 RECORD；维持 RTSP feedback 与视频数据口 keep-alive，视频数据口发送串行化以避免并发帧/心跳交错。初始 SETUP 返回事件端口时，按方向派生 HomeKit Events 密钥并连接 TCP 事件通道，分帧解析请求/应答，只确认请求（回显合法 CSeq）；事件命令目前仅确认，不处理触摸/HID 或 CarPlay 控制语义。新增 NAPI `OH_AVScreenCapture` H.264 编码输出与 `OH_ConsumerSurface_Create` 的真实虚拟屏 Surface；帧回调只通知专用工作线程，工作线程负责 acquire/release NativeWindowBuffer。用户主动点击“开始投屏”后，创建 1280x720 虚拟显示，并用 `UIAbilityContext.startAbility` 将独立 `ProjectionAbility` 定向到该 display，只采集该虚拟显示，不采集手机物理屏幕或其他应用。避免依赖需 `SYSTEM_FLOAT_WINDOW` 的 `window.createWindow`；仍需系统授予 `ACCESS_VIRTUAL_SCREEN`，任何权限/Ability/采集失败会明确报错，不回退到物理屏镜像。采集缓冲区队列有界，溢出会显式终止投屏；处理 codec data、分片和 Annex-B/长度前缀 NAL 后发送加密帧，只有首帧成功发送后状态才进入“投屏中”。虚拟屏权限、Ability 启动、编码回调、车机解码和实机画面仍需 PLR-AL00 与接收端验收，不能据 HAP 构建或协议测试宣称已经可正常投屏。
+- 新增媒体 wire codec：H.264 Annex-B/长度前缀 NAL 归一化、avcC 配置、128 字节屏幕流配置/帧/keepalive 封装、帧 ChaCha AAD/nonce，以及 PCM RTP/ChaCha 封包；有协议单测。视频流密钥按 `DataStream-Salt<streamConnectionID>` / `DataStream-Output-Encryption-Key` 从 pair-verify shared secret 派生，只在内存使用并在会话关闭时清零。收到邀请后，通过同一加密 RTSP 连接完成 `/info`、初始 SETUP、屏幕 SETUP、视频 TCP 数据口和 RECORD；维持 RTSP feedback、视频 keep-alive，并在视频 TCP 上串行发送。
+- 音频现在有受限 AAC-LC 发送路径：按 `/info.audioFormats` 只选择接收端明确声明的 `media` AAC-LC 档位；SETUP/二次 RECORD 后连接 UDP data/control port，按 `DataStream-Salt<streamConnectionID>` 派生密钥，发送 RTP/ChaCha 与 20 字节时钟同步包。NAPI `OH_AVScreenCapture` 可在视频捕获时同时请求内部 `OH_ALL_PLAYBACK` AAC；显式关闭麦克风输入。当前不支持 PCM 捕获/编码；AAC 编码输出、用户授权、音频同步和真实车机播放尚未在目标设备验证，不可据此宣称音频已实车可用。
+- 初始 SETUP 返回事件端口后，按方向派生 HomeKit Events 密钥、连接 TCP 事件通道并持续确认车机请求。已加入 `modesChanged` 资源声明、触摸 HID `hidSetInputMode`、Binary Plist 命令解析、Consumer/触摸 HID 报告识别、坐标缩放，以及 API 26 `TouchController`/键盘控制器适配。输入 API 在当前 phone 产品上会被 SDK 标记为不可用并要求 `CONTROL_DEVICE`；默认包未请求该受限权限，需由系统/厂商集成目标授权后实测。`iAPSendMessage` 虚拟 iAP2 隧道、HID 到完整 CarDeck 多屏/地图布局的分流、投影端 Dock/应用网格仍未移植，收到相关命令会明确记录未接入。
+- 新增 NAPI `OH_AVScreenCapture` H.264 编码输出与 `OH_ConsumerSurface_Create` 的真实虚拟屏 Surface；帧回调只通知专用工作线程，工作线程负责 acquire/release NativeWindowBuffer。用户主动点击“开始投屏”后，创建 1280x720 虚拟显示，并用 `UIAbilityContext.startAbility` 将独立 `ProjectionAbility` 定向到该 display，只采集该虚拟显示，不采集手机物理屏幕或其他应用。仍需系统授予 `ACCESS_VIRTUAL_SCREEN`；权限/Ability/采集失败明确报错，不回退到物理屏镜像。音视频队列有界，溢出会显式终止采集；只有首个视频帧成功发送后才进入“投屏中”。虚拟屏权限、目标 Ability、AAC/H.264 输出、车机解码、输入注入和实机画面均未在本轮目标设备验收；HAP 构建和协议测试不等同端到端可用。
 - 已补充 `0x4301 CarPlayStartSession` 解析：提取 AirPlay IP/端口和新协议无线组中的 Wi-Fi 参数；收到热点参数后加入 Wi-Fi，绑定成功后可用 iAP2 端点或 mDNS 端点探测 RTSP。
 - `GET_NETWORK_INFO` 已加入权限声明和运行时权限请求。此前的普通签名 HAP 已安装并在 PLR-AL00 启动，真机确认单开关、状态和滚动日志页面正常显示；早期探测显示虚拟屏能力未授予，且 phone 目标不支持触摸控制器。曾用本机签名材料和 ACL profile 验证 HAP 代码签名及权限签名，但设备拒绝安装该包（错误 `9568322`：应用来源不受信任），因此尚未验证 ACL 权限是否授予；本地签名材料现已从工作树移除。
 - 历史 `phoneDebug` 构建和权限签名验证不代表当前配置。本轮读取的产品为 `default`，使用既有 `localCerts` 签名；未修改用户签名配置或凭据。核验现有 profile 的 APL 为 `normal`，应用特征为 `hos_normal_app`，ACL 不含 `GET_BLUETOOTH_LOCAL_MAC`。
@@ -44,6 +47,25 @@
 - 本轮 default HAP 的 ArkTS/Native 构建成功。新增 iAP2 link 层序号/ACK/会话和 payload 长度日志；CSM 日志包含方向、消息 ID、参数 ID/长度及未解析字节数，只对身份能力清单中的白名单字段输出最多 64 字节十六进制，不写入 Wi-Fi、MFi challenge/签名、证书、密钥或媒体内容。AirPlay RTSP 记录请求方法/路径/CSeq、正文长度、加密状态、响应状态和头字段名称，不记录头字段值或正文。
 - 新增日志隐私回归用例，覆盖身份字符串和 Wi-Fi SSID/密码不出现在协议日志中；该新增 Hypium 用例尚未在设备上执行。
 - 最新 HDC 查询中 PLR-AL00 连接状态为 Offline，安装新 HAP 与设备侧权限/虚拟屏测试尚未完成。当前没有可用 CarPlay/DiPlay 接收端，真实蓝牙握手、虚拟屏画面采集、AirPlay 首帧及车机显示仍为未验收项；不得将本轮构建成功描述为端到端成功。
+
+## 未完成项与阻塞
+
+以下清单聚合当前实现状态、API 映射、POC 门槛与风险表中的剩余工作。状态区分代码缺口、系统集成阻塞和设备验收未完成；现有构建/单测成功不代表实机功能已验收。
+
+| 优先级 | 未完成项 | 当前状态与阻塞 | 完成判据 |
+|---|---|---|---|
+| P0 | 确认最终设备与系统集成契约 | 本轮最终型号、HarmonyOS/API 26 build、厂商/系统签名来源及获批系统 API 尚未确认。PLR-AL00 仅是历史探索设备；当前 `default` 是 phone 目标，SDK 将虚拟屏/输入注入 API 标为不可用，并要求 `ACCESS_VIRTUAL_SCREEN`、`CONTROL_DEVICE` 等系统能力。 | 在选定设备、最终签名和 API 版本上核验权限 token、API 能力和蓝牙身份来源；由厂商确认受限权限/API 的集成方式。不得把普通 phone HAP 构建成功当作系统权限已授予。 |
+| P0 | 建立可重复的设备与接收端验证环境 | 当前没有已确认连接的 CarPlay/DiPlay 接收端；本机 `hdc` 不在当前 shell PATH，历史记录中的 PLR-AL00 状态为 Offline。 | 可从当前开发环境安装/启动最终签名 HAP，读取诊断日志，并连接 DiPlay 或兼容接收端；实车验证设备需明确型号与系统版本。 |
+| P1 | 验收蓝牙、身份与网络传输 | RFCOMM/SPP、iAP2/MFi、WLAN、mDNS、邀请服务和 AirPlay socket 适配已有实现，但本轮没有真实车机握手、身份字段兼容、热点路由或邀请时序证据。真实蓝牙地址读取仍受系统权限限制，手工配置来源不能视为自动核验。 | 在选定设备上完成 RFCOMM 字节流/iAP2/MFi，验证真实身份用于 `0x4300`、`0x4E0E` 和 AirPlay `deviceID`，并证明 Wi-Fi、mDNS、RTSP 均走车机网络。 |
+| P1 | 实现虚拟 iAP2 隧道与车机命令语义 | AirPlay 事件通道已解析 `hidSendReport`、`iAPSendMessage` 等命令；但 `iAPSendMessage` 目前只记录，不驱动第二条虚拟 iAP2 链路。MIB3/部分车机的 marker、双向 `POST /command` 与第二链路时序未移植。 | 完成并测试虚拟链路的 marker/SYN/SYN-ACK、CSM 身份/MFi、订阅及 HID 消息；覆盖事件/控制通道和可选隧道 TCP 的正确收发方向。 |
+| P1 | 补齐 CarDeck 投影界面与多屏应用体验 | 当前投影主要是单个 1280x720 `ProjectionAbility` 占位界面；Dock、应用网格、独立应用/地图屏、显示合成、应用状态/媒体卡、主题/壁纸/暗幕及对应坐标分流尚未完成。任意第三方 Ability 是否能显示在目标 display 也未验证。 | 在获准系统目标上创建/销毁多屏，将测试及目标应用放到正确 display；实现 Dock/应用/地图布局与方向/resize 映射，确保车机可操作而非仅显示自有占位页。 |
+| P1 | 验收完整 H.264 视频投屏 | 已有虚拟屏 Surface、H.264 捕获/封包和 TCP 发送代码，但最终设备授权、编码输出格式、目标车机解码、首帧显示和持续运行均未验证。 | 目标车机实际显示首帧；测量帧率/延迟/背压，连续运行至少 10 分钟，并覆盖方向变化、采集停止、重建和断连清理。 |
+| P1 | 完成跨车机音频能力 | 代码目前只协商接收端公告的 AAC-LC `media` 档；PCM 捕获/编码回退未实现。内部播放音频授权、AAC access unit/采样率与车机协商一致性、同步包及车机实际播放均未验收。 | 在目标设备确认能够采集被允许的其他应用播放音频并稳定输出车机接受的格式；验证 RTP/ChaCha、controlPort 时钟同步和播放。若目标车机只支持 PCM，先补齐 PCM 路径再宣称该车机支持音频。 |
+| P1 | 完成系统输入回控 | 直接 HID 解析、坐标缩放和 `TouchController`/媒体键适配已有代码；当前 phone SDK 明确提示输入 API 不可用且要求 `CONTROL_DEVICE`，默认包未请求该受限权限。第二 iAP2 链路中的 HID 与多屏/地图触摸分流也未接通。 | 获批的系统/厂商目标能够创建输入控制器；实测单指/多指、按键、坐标边缘/方向变换、DOWN/MOVE/UP 配对，以及取消/断连时释放所有状态。 |
+| P2 | 完成端到端车机兼容矩阵 | 当前无本轮接收端日志证明完整连接链路；HomeKit/HUKS、旧版无加密路径、不同 MFi challenge、迟到端点及 MIB3 第二链路仍缺真机证据。 | 用 DiPlay 回归并至少在一台指定实车完成蓝牙→iAP2→Wi-Fi/mDNS→AirPlay→首帧→音频/HID 全链路；逐项记录车型/系统/权限/结果，未测车型明确标注不支持或未知。 |
+| P3 | 完成稳定性、隐私与交付验证 | 现有队列与脱敏测试不覆盖系统进程退出、长时采集、功耗/温升、安装签名与后台策略。 | 覆盖前后台、锁屏/息屏、网络切换、取消/重连、进程被杀和资源回收；核查性能、日志脱敏、最终签名/权限 profile 与发布材料。 |
+
+**当前完成度边界**：本移植仍不是完整 CarDeck 等价客户端。协议单测、ArkTS 编译或 HAP 构建只证明相应代码可编译/通过测试；只有 P0 条件满足并完成 P1/P2 的设备验收后，才可更新为完整可用。
 
 ## 本机蓝牙身份：接口、权限与使用
 
@@ -135,12 +157,12 @@ if (-not (Test-Path '.\build-profile.json5')) {
 | TCP/UDP AirPlay 与媒体流 | `@kit.NetworkKit` Socket Kit；保留 RTSP 控制、事件 TCP、视频 TCP、音频 UDP 的独立连接和读写线程 | 公共网络能力可承载；需要验证切前后台、热点丢失及应用生命周期下连接的保活/恢复 |
 | 虚拟屏创建与销毁 | `@ohos.display` `createVirtualScreen` / `destroyVirtualScreen`，屏幕 Surface 绑定到真实 ConsumerSurface | 当前 phone 目标被 SDK 标记为 API 不可用；本轮 HAP 已安装，但设备锁屏期间未能启动应用，虚拟屏权限与运行时结果仍未验证。需厂商/系统集成及支持该 API 的设备类型 |
 | 在虚拟屏启动 Ability | `UIAbilityContext.startAbility(want, { displayId })` | API 文档提供 `displayId` 选项；实现已改为启动独立 `ProjectionAbility`，但设备锁屏时启动命令被拒绝，尚未验证实际显示，也不代表任意 Ability 都支持目标显示屏 |
-| 触摸回注 | 在支持该 API 的系统/特权目标上，使用 SDK API 26 `@ohos.multimodalInput.inputEventClient` 的 `TouchController.touchDown/touchMove/touchUp`，按 `displayId` 构造触点 | 当前 phone 目标被 SDK 标记为 API 不可用，因此 phone 包不声明 `CONTROL_DEVICE` 或执行触摸探测；其他目标类型需厂商/系统集成后单独验证 |
+| 触摸回注 | 使用 SDK API 26 `@kit.InputKit` 的 `inputEventClient.createTouchController()`，按 `displayId` 构造并释放触点；Consumer HID 可映射至系统媒体键 | 适配器已实现并由 ArkTS 编译；当前 phone SDK 明确警告 API 不可用且需要 `CONTROL_DEVICE`。默认包不声明该受限权限，完整回控仍需获批系统/厂商目标并真机验证 |
 | H.264 编码 | AVCodec Kit 原生 surface 输入模式，封装为 N-API/ArkTS 可调用的媒体适配器 | 官方提供硬件视频编码 surface 模式；需验证虚拟屏输出 Surface 能否直接连接编码器输入 Surface，无法直连时测量一次 GPU 合成/拷贝的成本 |
-| 音频采集与编码 | Harmony 音频采集/编码 API 独立适配 | **待 POC**：确认是否能按现有 Android AudioPlaybackCapture 语义采集其他应用播放音频、授权 UX 与后台限制；不能将麦克风采集等同于系统播放音频采集 |
+| 音频采集与编码 | `OH_AVScreenCapture` 内部播放音频 AAC-LC 编码与 AirPlay RTP/ChaCha 发送 | 已实现只针对接收端公告 AAC-LC `media` 档的 SETUP/RTP/同步路径，并关闭麦克风采集；PCM 路径未实现。授权、后台策略、编码帧形式和车机实际播放仍需最终目标设备 POC |
 | 设备身份 | 适配 iAP2/AirPlay 需要的设备名、蓝牙地址及连接端点 | **待 POC/高风险**：Bluetooth Socket 文档说明 `getDeviceId()` 为隐私保护返回虚拟 MAC。不能直接假设它可替代 CarDeck 依赖的真实稳定蓝牙地址；应从目标系统权限/API 与车机侧校验确认 |
 
-目标设备 API 版本为 26。本轮移除需要系统授权的 `SYSTEM_FLOAT_WINDOW` 和 `window.createWindow`，改用独立 `ProjectionAbility` 定向启动；签名 HAP 已于 2026-10-22 成功安装到 PLR-AL00。随后启动命令因设备锁屏失败（错误 `10106102`，开发者模式下不能自动解锁），所以尚未验证 `ACCESS_VIRTUAL_SCREEN` 的运行时授权、虚拟屏创建或画面输出。当前模块目标是 phone，SDK 将虚拟屏和触摸控制器 API 均标记为不可用；不能据成功安装推断这些 API 可用。完整显示/回控能力仍需解锁后在目标设备验证，并可能需要厂商/系统集成及支持这些 API 的目标类型。
+目标设备 API 版本为 26。本轮移除需要系统授权的 `SYSTEM_FLOAT_WINDOW` 和 `window.createWindow`，改用独立 `ProjectionAbility` 定向启动；签名 HAP 已于 2026-10-22 成功安装到 PLR-AL00。随后启动命令因设备锁屏失败（错误 `10106102`，开发者模式下不能自动解锁），所以尚未验证 `ACCESS_VIRTUAL_SCREEN` 的运行时授权、虚拟屏创建或画面输出。当前模块目标是 phone，SDK 将虚拟屏和触摸控制器 API 均标记为不可用；不能据成功安装推断这些 API 可用。完整显示/回控能力仍需解锁后在目标设备验证，并可能需要厂商/系统集成及支持这些 API 的目标类型。PLR-AL00 是既有探索记录中的设备，不代表本轮最终目标型号或系统集成签名已确认。
 
 ## 推荐架构
 
@@ -180,7 +202,7 @@ if (-not (Test-Path '.\build-profile.json5')) {
 3. **编码门**：创建 AVCodec surface 输入，验证虚拟屏最终合成画面能以目标 H.264 profile、分辨率和帧率进入编码器。连续采集至少 10 分钟，检查掉帧、内存/图形资源增长、屏幕 resize 和编码器销毁重建。
 4. **输入门**：从指定屏幕注入单指点击、长按、滑动，以及目标应用需要的多指手势；验证事件落到正确 display/window，坐标边缘、旋转和地图屏 resize 均正确。
 5. **传输门**：完成 iAP2 RFCOMM 连通性、目标 UUID、Bluetooth 身份字段、热点 candidate config、Socket 路由、mDNS 发布/发现的最小互通。特别检查真实/虚拟 MAC 对 `0x4300/0x4E0E` 与 AirPlay `deviceID` 的影响。
-6. **音频门**：确认能采集目标应用播放音频并编码为车机实际协商格式；若只能采集麦克风或仅采集自有应用，产品范围需明确降级。
+6. **音频门**：确认屏幕采集授权确实提供目标应用内部播放音频、AAC access unit 格式与采样率匹配车机协商，并在有 controlPort 时验证 RTP/NTP 同步；若车机只支持 PCM 或不允许内部音频采集，当前 AAC-only 实现不能满足音频功能，需补 PCM 编码路径或明确阻塞。
 
 **Go 条件**：系统权限可在目标设备稳定获得；目标 Ability 能进入虚拟屏；Surface 编码链路可持续运行；触摸注入按屏幕正确命中；iAP2 所需身份和车机 Wi-Fi 网络可用。任一前四项失败，不能宣称达成“鸿蒙自建虚拟屏 + 任意应用投屏 + 车机触摸回控”。
 
@@ -226,7 +248,7 @@ if (-not (Test-Path '.\build-profile.json5')) {
 | Surface 与 AVCodec surface 连接方式未知 | 可能需要额外拷贝，增加延迟/功耗 | POC 先确定 Surface 互通；端到端延迟、帧率和温升未达标即调整架构 |
 | WLAN candidate config 的设备实现及绑定行为 | 控制 socket 走错网或网络被系统切换 | 同时验证 SSID、路由、mDNS 可见性、AirPlay TCP/UDP 真实出接口；WEP 为独立回退项 |
 | 真实 Bluetooth MAC 不可见/被随机化 | 接收端按 `deviceID` 过滤或 iAP2 身份校验失败 | 取得设备侧合法身份 API或使用厂商接口；不能靠固定假 MAC 掩盖 |
-| 播放音频采集权限/后台策略 | 车机无声 | 独立 POC；不可采集其他应用音频时明确不支持系统媒体回传 |
+| 播放音频采集权限/后台策略及 AAC 编码输出 | 车机无声或 AAC profile 不匹配 | 已实现内部播放 AAC-LC 的候选协商和发送；最终签名/系统授权、后台行为、输出是否为可直接 RTP 的 AAC access unit 以及真实播放仍需 POC；PCM 车机暂不支持 |
 | iAP2/MFi/CarPlay 互通差异 | 某些车机拒绝配对或早拆会话 | 继续按车型能力、挑战记忆、迟到消息和协议笔记分流；以真车日志为依据 |
 
 ## 接口与代码落点建议

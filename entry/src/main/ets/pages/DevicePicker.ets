@@ -1,6 +1,6 @@
 import { PageHeader, showPageError } from '../components/PageHeader';
 import { isCarPlaySessionActive, carPlaySessionController } from '../app/session/CarPlaySessionController';
-import { PairedAccessory } from '../platform/bluetooth/HarmonySppClient';
+import { PairedAccessory } from '../platform/bluetooth/HarmonySppServer';
 import { carPlaySettings } from '../platform/settings/HarmonySettings';
 
 @Entry

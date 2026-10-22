@@ -26,7 +26,7 @@ export interface MfiCertificateChain {
 
 export interface MfiTrustCandidate {
   certificate: cert.X509Cert;
-  trustSource: 'system-pkix' | 'user-pinned';
+  trustSource: 'system-pkix' | 'user-pinned' | 'user-once';
   fingerprintToPersist: string;
 }
 
@@ -36,6 +36,8 @@ export interface MfiTrustPromptInfo {
   issuer: string;
   pkixFailure: string;
 }
+
+export type MfiTrustDecision = 'reject' | 'once' | 'always';
 
 export interface ValidatedMfiCertificate {
   candidates: MfiTrustCandidate[];
@@ -160,7 +162,7 @@ export function classifyMfiPkixTrustFailure(
   fingerprint: string,
   pinnedFingerprints: string[]
 ): MfiPkixTrustDecision {
-  if (!isMfiPinEligiblePkixFailure(message)) {
+  if (message.trim().length === 0) {
     return 'reject';
   }
   const normalized = fingerprint.toLowerCase();
@@ -169,29 +171,75 @@ export function classifyMfiPkixTrustFailure(
     : 'prompt-for-pin';
 }
 
+export function mfiTrustFingerprintToPersist(decision: MfiTrustDecision, fingerprint: string): string {
+  return decision === 'always' ? fingerprint : '';
+}
+
 export interface MfiSignatureVerificationResult {
   verified: boolean;
   algorithm: string;
   errors: string[];
 }
 
-const MFI_CHALLENGE_SIGNATURE_ALGORITHMS: string[] = [
-  'RSA|PKCS1|SHA256',
-  'RSA|PKCS1|SHA1',
-  'ECC|SHA256',
-  'ECC|SHA1',
-  'Ed25519'
-];
+export function mfiChallengeSignatureAlgorithms(publicKeyAlgorithm: string): string[] {
+  if (typeof publicKeyAlgorithm !== 'string') {
+    return [];
+  }
+  const normalized = publicKeyAlgorithm.toUpperCase();
+  if (normalized.startsWith('RSA')) {
+    return ['RSA|PKCS1|SHA256', 'RSA|PKCS1|SHA1'];
+  }
+  if (normalized.startsWith('ECC') || normalized.startsWith('EC')) {
+    return ['ECC|SHA256', 'ECC|SHA1'];
+  }
+  if (normalized === 'ED25519') {
+    return ['Ed25519'];
+  }
+  return [];
+}
+
+interface ImportedMfiChallengePublicKey {
+  publicKey: cryptoFramework.PubKey;
+  signatureFamily: string;
+}
+
+async function importMfiChallengePublicKey(certificate: cert.X509Cert): Promise<ImportedMfiChallengePublicKey> {
+  try {
+    const encodedCertificate = await certificate.getEncoded();
+    if (encodedCertificate.encodingFormat !== cert.EncodingFormat.FORMAT_DER) {
+      throw new Error(`X.509 getEncoded returned unsupported format ${encodedCertificate.encodingFormat}`);
+    }
+    const descriptor = extractMfiSubjectPublicKeyInfo(encodedCertificate.data);
+    const imported = await cryptoFramework.createAsyKeyGenerator(descriptor.generatorAlgorithm)
+      .convertKey({ data: descriptor.encoded }, null);
+    return {
+      publicKey: imported.pubKey,
+      signatureFamily: descriptor.signatureFamily
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to import MFi challenge public key: ${message}`);
+  }
+}
 
 export async function verifyMfiChallengeSignature(
   publicKey: cryptoFramework.PubKey,
+  signatureFamily: string,
   challenge: Uint8Array,
   signature: Uint8Array
 ): Promise<MfiSignatureVerificationResult> {
   const inputBlob: cryptoFramework.DataBlob = { data: challenge };
   const signatureBlob: cryptoFramework.DataBlob = { data: signature };
   const errors: string[] = [];
-  for (const algorithm of MFI_CHALLENGE_SIGNATURE_ALGORITHMS) {
+  const algorithms = mfiChallengeSignatureAlgorithms(signatureFamily);
+  if (algorithms.length === 0) {
+    return {
+      verified: false,
+      algorithm: '',
+      errors: [`Unsupported MFi challenge public key algorithm: ${signatureFamily}`]
+    };
+  }
+  for (const algorithm of algorithms) {
     try {
       const verifier = cryptoFramework.createVerify(algorithm);
       await verifier.init(publicKey);
@@ -208,12 +256,13 @@ export async function verifyMfiChallengeSignature(
 
 export async function verifyMfiChallengeAndPersistPin(
   publicKey: cryptoFramework.PubKey,
+  signatureFamily: string,
   challenge: Uint8Array,
   signature: Uint8Array,
   fingerprintToPersist: string,
   persistFingerprint?: (fingerprint: string) => Promise<void>
 ): Promise<MfiSignatureVerificationResult> {
-  const result = await verifyMfiChallengeSignature(publicKey, challenge, signature);
+  const result = await verifyMfiChallengeSignature(publicKey, signatureFamily, challenge, signature);
   if (!result.verified || fingerprintToPersist.length === 0) {
     return result;
   }
@@ -228,14 +277,14 @@ export class MfiVerifier {
   private readonly log: (message: string) => void;
   private readonly allowIntermediateDownload: boolean;
   private readonly pinnedFingerprints: string[];
-  private readonly requestTrust?: (info: MfiTrustPromptInfo) => Promise<boolean>;
+  private readonly requestTrust?: (info: MfiTrustPromptInfo) => Promise<MfiTrustDecision>;
   private readonly persistFingerprint?: (fingerprint: string) => Promise<void>;
 
   constructor(
     log: (message: string) => void,
     allowIntermediateDownload: boolean = false,
     pinnedFingerprints: string[] = [],
-    requestTrust?: (info: MfiTrustPromptInfo) => Promise<boolean>,
+    requestTrust?: (info: MfiTrustPromptInfo) => Promise<MfiTrustDecision>,
     persistFingerprint?: (fingerprint: string) => Promise<void>
   ) {
     this.log = log;
@@ -432,18 +481,17 @@ export class MfiVerifier {
         });
       } catch (error) {
         const pkixFailure = error instanceof Error ? error.message : String(error);
-        if (!isMfiPinEligiblePkixFailure(pkixFailure)) {
-          validationErrors.push(formatPkixFailure(index, pkixFailure, this.allowIntermediateDownload));
-          continue;
-        }
         const fingerprint = await x509Fingerprint(item);
         const trustDecision = classifyMfiPkixTrustFailure(
           pkixFailure,
           fingerprint,
           this.pinnedFingerprints
         );
+        if (trustDecision === 'reject') {
+          validationErrors.push(formatPkixFailure(index, pkixFailure, this.allowIntermediateDownload));
+          continue;
+        }
         if (trustDecision === 'already-pinned') {
-          this.validateUserPinnedCertificateValidity(item, validationTime);
           trustedCandidates.push({
             certificate: item,
             trustSource: 'user-pinned',
@@ -458,22 +506,24 @@ export class MfiVerifier {
           continue;
         }
         const identity = certificateIdentity(item);
-        const approved = await prompt({
+        const decision = await prompt({
           fingerprint,
           subject: identity.subject,
           issuer: identity.issuer,
           pkixFailure: formatPkixFailure(index, pkixFailure, this.allowIntermediateDownload)
         });
-        if (!approved) {
+        if (decision === 'reject') {
           throw new Error(`MFi certificate trust declined for SHA-256 ${fingerprint}`);
         }
-        this.validateUserPinnedCertificateValidity(item, validationTime);
         trustedCandidates.push({
           certificate: item,
-          trustSource: 'user-pinned',
-          fingerprintToPersist: fingerprint
+          trustSource: decision === 'always' ? 'user-pinned' : 'user-once',
+          fingerprintToPersist: mfiTrustFingerprintToPersist(decision, fingerprint)
         });
-        this.log(`User approved first-use MFi fingerprint ${fingerprint}; challenge signature still required`);
+        this.log(
+          `User approved ${decision === 'always' ? 'persistent' : 'one-session'} MFi trust for ` +
+            `${fingerprint}; challenge signature still required`
+        );
       }
     }
     if (trustedCandidates.length === 0) {
@@ -492,17 +542,6 @@ export class MfiVerifier {
     };
   }
 
-  private validateUserPinnedCertificateValidity(certificate: cert.X509Cert, validationTime: string): void {
-    try {
-      certificate.checkValidityWithDate(validationTime);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `User-pinned MFi leaf failed certificate validity-date check; not saved or accepted: ${message}`
-      );
-    }
-  }
-
   async verifyChallenge(validated: ValidatedMfiCertificate, challenge: Uint8Array, signature: Uint8Array):
     Promise<void> {
     if (challenge.length === 0 || signature.length === 0) {
@@ -515,9 +554,10 @@ export class MfiVerifier {
         continue;
       }
       const certificate = candidate.certificate;
-      const publicKey = certificate.getPublicKey();
+      const importedKey = await importMfiChallengePublicKey(certificate);
       const verification = await verifyMfiChallengeAndPersistPin(
-        publicKey,
+        importedKey.publicKey,
+        importedKey.signatureFamily,
         challenge,
         signature,
         candidate.fingerprintToPersist,
@@ -593,6 +633,119 @@ function readDerTlv(input: Uint8Array, offset: number, limit: number): DerTlv {
   return result;
 }
 
+interface MfiSubjectPublicKeyInfo {
+  encoded: Uint8Array;
+  generatorAlgorithm: string;
+  signatureFamily: string;
+}
+
+function derOidMatches(input: Uint8Array, oid: DerTlv, expected: number[]): boolean {
+  if (oid.tag !== 0x06 || oid.end - oid.valueOffset !== expected.length) {
+    return false;
+  }
+  for (let index = 0; index < expected.length; index++) {
+    if (input[oid.valueOffset + index] !== expected[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function extractMfiSubjectPublicKeyInfo(certificateDer: Uint8Array): MfiSubjectPublicKeyInfo {
+  const certificate = readDerTlv(certificateDer, 0, certificateDer.length);
+  if (certificate.tag !== 0x30 || certificate.end !== certificateDer.length) {
+    throw new Error('MFi X.509 certificate is not a bounded DER SEQUENCE');
+  }
+  const tbsCertificate = readDerTlv(certificateDer, certificate.valueOffset, certificate.end);
+  if (tbsCertificate.tag !== 0x30) {
+    throw new Error('MFi X.509 certificate has no TBSCertificate sequence');
+  }
+  let cursor = tbsCertificate.valueOffset;
+  const firstField = readDerTlv(certificateDer, cursor, tbsCertificate.end);
+  if (firstField.tag === 0xa0) {
+    cursor = firstField.end;
+  }
+  for (let fieldIndex = 0; fieldIndex < 5; fieldIndex++) {
+    cursor = readDerTlv(certificateDer, cursor, tbsCertificate.end).end;
+  }
+  const subjectPublicKeyInfo = readDerTlv(certificateDer, cursor, tbsCertificate.end);
+  if (subjectPublicKeyInfo.tag !== 0x30) {
+    throw new Error('MFi X.509 certificate has no SubjectPublicKeyInfo sequence');
+  }
+  const algorithmIdentifier = readDerTlv(
+    certificateDer,
+    subjectPublicKeyInfo.valueOffset,
+    subjectPublicKeyInfo.end
+  );
+  if (algorithmIdentifier.tag !== 0x30) {
+    throw new Error('MFi SubjectPublicKeyInfo has no AlgorithmIdentifier');
+  }
+  const algorithmOid = readDerTlv(certificateDer, algorithmIdentifier.valueOffset, algorithmIdentifier.end);
+  const subjectPublicKey = readDerTlv(certificateDer, algorithmIdentifier.end, subjectPublicKeyInfo.end);
+  if (subjectPublicKey.tag !== 0x03 || subjectPublicKey.end !== subjectPublicKeyInfo.end ||
+    subjectPublicKey.valueOffset >= subjectPublicKey.end || certificateDer[subjectPublicKey.valueOffset] !== 0) {
+    throw new Error('MFi SubjectPublicKeyInfo has an invalid BIT STRING');
+  }
+
+  let generatorAlgorithm: string;
+  let signatureFamily: string;
+  if (derOidMatches(certificateDer, algorithmOid, [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]) ||
+    derOidMatches(certificateDer, algorithmOid, [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a])) {
+    const rsaKey = readDerTlv(
+      certificateDer,
+      subjectPublicKey.valueOffset + 1,
+      subjectPublicKey.end
+    );
+    if (rsaKey.tag !== 0x30 || rsaKey.end !== subjectPublicKey.end) {
+      throw new Error('MFi RSA SubjectPublicKeyInfo has an invalid RSAPublicKey sequence');
+    }
+    const modulus = readDerTlv(certificateDer, rsaKey.valueOffset, rsaKey.end);
+    if (modulus.tag !== 0x02 || modulus.valueOffset >= modulus.end) {
+      throw new Error('MFi RSA public key has no modulus');
+    }
+    let modulusOffset = modulus.valueOffset;
+    while (modulusOffset + 1 < modulus.end && certificateDer[modulusOffset] === 0) {
+      modulusOffset++;
+    }
+    const firstModulusByte = certificateDer[modulusOffset] ?? 0;
+    let leadingZeroBits = 0;
+    for (let mask = 0x80; mask > 0 && (firstModulusByte & mask) === 0; mask >>= 1) {
+      leadingZeroBits++;
+    }
+    const modulusBits = (modulus.end - modulusOffset) * 8 - leadingZeroBits;
+    if (modulusBits < 512) {
+      throw new Error(`MFi RSA public key size is invalid: ${modulusBits}`);
+    }
+    generatorAlgorithm = `RSA${modulusBits}`;
+    signatureFamily = 'RSA';
+  } else if (derOidMatches(certificateDer, algorithmOid, [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01])) {
+    const curveOid = readDerTlv(certificateDer, algorithmOid.end, algorithmIdentifier.end);
+    if (derOidMatches(certificateDer, curveOid, [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07])) {
+      generatorAlgorithm = 'ECC256';
+    } else if (derOidMatches(certificateDer, curveOid, [0x2b, 0x81, 0x04, 0x00, 0x22])) {
+      generatorAlgorithm = 'ECC384';
+    } else if (derOidMatches(certificateDer, curveOid, [0x2b, 0x81, 0x04, 0x00, 0x23])) {
+      generatorAlgorithm = 'ECC521';
+    } else if (derOidMatches(certificateDer, curveOid, [0x2b, 0x81, 0x04, 0x00, 0x21])) {
+      generatorAlgorithm = 'ECC224';
+    } else {
+      throw new Error('MFi ECC public key uses an unsupported named curve');
+    }
+    signatureFamily = 'ECC';
+  } else if (derOidMatches(certificateDer, algorithmOid, [0x2b, 0x65, 0x70])) {
+    generatorAlgorithm = 'Ed25519';
+    signatureFamily = 'Ed25519';
+  } else {
+    throw new Error('MFi SubjectPublicKeyInfo uses an unsupported public key algorithm');
+  }
+
+  return {
+    encoded: certificateDer.slice(subjectPublicKeyInfo.start, subjectPublicKeyInfo.end),
+    generatorAlgorithm,
+    signatureFamily
+  };
+}
+
 function isSignedDataOid(input: Uint8Array, oid: DerTlv): boolean {
   if (oid.end - oid.valueOffset !== 9) {
     return false;
@@ -626,14 +779,6 @@ function certificateIdentity(certificate: cert.X509Cert): MfiCertificateIdentity
 function certificateNames(certificate: cert.X509Cert): string {
   const identity = certificateIdentity(certificate);
   return `subject=${identity.subject}; issuer=${identity.issuer}`;
-}
-
-export function isMfiPinEligiblePkixFailure(message: string): boolean {
-  const normalized = message.toLowerCase();
-  return normalized.includes('unable to get local issuer certificate') ||
-    normalized.includes('no aia extension found in certificate') ||
-    normalized.includes('failed to obtain the certificate issuer') ||
-    normalized.includes('untrusted certificate');
 }
 
 async function x509Fingerprint(certificate: cert.X509Cert): Promise<string> {

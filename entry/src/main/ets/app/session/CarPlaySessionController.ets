@@ -1,6 +1,6 @@
 import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
-import { HarmonySppClient, PairedAccessory, SppConnection } from '../../platform/bluetooth/HarmonySppClient';
+import { HarmonySppServer, PairedAccessory, SppConnection } from '../../platform/bluetooth/HarmonySppServer';
 import { HarmonyBluetoothIdentityProvider } from '../../platform/bluetooth/HarmonyBluetoothIdentityProvider';
 import {
   BluetoothIdentitySource, ConfiguredBluetoothIdentityProvider
@@ -15,16 +15,21 @@ import {
   CarPlayStartSessionEndpoint,
   Iap2SenderSession
 } from '../../protocol/iap2/Iap2SenderSession';
-import { MfiTrustPromptInfo, MfiVerifier } from '../../protocol/iap2/MfiVerifier';
+import {
+  MfiTrustDecision, MfiTrustPromptInfo, MfiVerifier
+} from '../../protocol/iap2/MfiVerifier';
 import { HarmonyWifiClient } from '../../platform/network/HarmonyWifiClient';
 import { AirPlayServiceEndpoint, HarmonyMdnsBrowser } from '../../platform/network/HarmonyMdnsBrowser';
 import { HarmonyAirPlayClient } from '../../platform/network/HarmonyAirPlayClient';
 import { HarmonyAirPlayMediaSession } from '../../platform/network/HarmonyAirPlayMediaSession';
 import { HarmonyVirtualDisplay } from '../../platform/network/HarmonyVirtualDisplay';
+import { HarmonyTouchInputController } from '../../platform/input/HarmonyTouchInputController';
+import { HarmonyMediaKeyInputController } from '../../platform/input/HarmonyMediaKeyInputController';
 import {
   CarPlayInviteServer
 } from '../../platform/network/HarmonyCarPlayInviteServer';
 import { CarPlayInviteRequest } from '../../protocol/airplay/CarPlayInviteProtocol';
+import { AirPlayEventCommand, AirPlayEventProtocol } from '../../protocol/airplay/AirPlayEventProtocol';
 
 export type CarPlaySessionState =
   'idle' | 'connecting' | 'bluetooth-connected' | 'iap2-negotiating' | 'iap2-ready' |
@@ -53,7 +58,7 @@ type SessionListener = (snapshot: CarPlaySessionSnapshot) => void;
 
 class CarPlaySessionController {
   private static readonly MAX_LOG_LINES = 250;
-  private readonly sppClient: HarmonySppClient = new HarmonySppClient();
+  private readonly sppServer: HarmonySppServer = new HarmonySppServer();
   private readonly listeners: Set<SessionListener> = new Set<SessionListener>();
   private logs: string[] = [];
   private devices: PairedAccessory[] = [];
@@ -81,6 +86,8 @@ class CarPlaySessionController {
   private inviteServer: CarPlayInviteServer | undefined = undefined;
   private airPlayMediaSession: HarmonyAirPlayMediaSession | undefined = undefined;
   private virtualDisplay: HarmonyVirtualDisplay | undefined = undefined;
+  private readonly touchInput: HarmonyTouchInputController = new HarmonyTouchInputController();
+  private readonly mediaKeyInput: HarmonyMediaKeyInputController = new HarmonyMediaKeyInputController();
   private pendingStartSession: CarPlayStartSessionEndpoint | undefined = undefined;
   private latestAirPlayEndpoint: AirPlayServiceEndpoint | undefined = undefined;
   private readonly airPlayProbeKeys: Set<string> = new Set<string>();
@@ -90,7 +97,7 @@ class CarPlaySessionController {
   private receivedCarPlayInvite: boolean = false;
   private pairingStarted: boolean = false;
   private mfiTrustRequest: MfiTrustPromptInfo | undefined = undefined;
-  private mfiTrustResolver: ((approved: boolean) => void) | undefined = undefined;
+  private mfiTrustResolver: ((decision: MfiTrustDecision) => void) | undefined = undefined;
   private mfiTrustTimer: number | undefined = undefined;
   constructor() {
     carPlayDiagnostics.subscribe((line: string) => {
@@ -147,15 +154,8 @@ class CarPlaySessionController {
     }
     const accessManager = abilityAccessCtrl.createAtManager();
     const granted = accessManager.checkAccessTokenSync(context.applicationInfo.accessTokenId, 'ohos.permission.ACCESS_BLUETOOTH');
-    if (snapshot.settings.targetDeviceId.length === 0 ||
-      granted !== abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
-      this.blockSession('已记住 CarPlay 开启状态；请在设置选择接收端，并手动重试以完成蓝牙授权。');
-      return;
-    }
-    if (snapshot.settings.localBluetoothAddress.length === 0 &&
-      accessManager.checkAccessTokenSync(context.applicationInfo.accessTokenId,
-        'ohos.permission.GET_BLUETOOTH_LOCAL_MAC') !== abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
-      this.blockSession('已记住 CarPlay 开启状态，但缺少可用的本机蓝牙地址；请在设置填写后重试。');
+    if (granted !== abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+      this.blockSession('已记住 CarPlay 开启状态；请手动重试并完成蓝牙授权。');
       return;
     }
     this.appendLog('恢复已保存的 CarPlay 开启意图；本次应用启动仅自动尝试一次。');
@@ -282,8 +282,8 @@ class CarPlaySessionController {
   }
 
   private loadAccessories(): void {
-    this.devices = this.sppClient.pairedAccessories();
-    this.appendLog(`读取到 ${this.devices.length} 个已配对设备；只连接用户选定的接收端。`);
+    this.devices = this.sppServer.pairedAccessories();
+    this.appendLog(`读取到 ${this.devices.length} 个已配对设备；车机将主动连接手机监听服务。`);
     this.notify();
   }
 
@@ -312,7 +312,7 @@ class CarPlaySessionController {
     this.setState('connecting');
     this.appendLog(`phone=${deviceInfo.productModel}; osBuild=${deviceInfo.osFullName.replace(/\./g, '_')}; sdk=${deviceInfo.sdkApiVersion}`);
     this.appendLog('本次先核验蓝牙身份；身份不可用仍可诊断 RFCOMM/iAP2，但不表示已具备投屏能力。');
-    this.appendLog('正在请求蓝牙权限并检查已配对车机。');
+    this.appendLog('正在请求蓝牙权限并读取本机蓝牙身份。');
     let stage = '蓝牙权限请求';
     try {
       const permissions: Permissions[] = ['ohos.permission.ACCESS_BLUETOOTH'];
@@ -331,89 +331,109 @@ class CarPlaySessionController {
       if (!this.isCurrent(generation)) {
         return;
       }
-      this.loadAccessories();
-      const target = this.devices.find((device: PairedAccessory) => device.deviceId === this.selectedDeviceId);
-      if (target === undefined) {
-        this.failSession('尚未选择接收端；请刷新已配对设备并选择车机或 DiPlay，再开启连接。');
-        return;
-      }
-      stage = 'iAP2 RFCOMM 服务连接';
-      const connection = await this.sppClient.connectToAccessory(
-        target,
+      stage = 'iAP2 RFCOMM 监听启动';
+      await this.sppServer.listenForAccessory(
+        (connection: SppConnection) => this.handleSppConnection(connection, generation),
         () => this.isCurrent(generation),
         (message: string) => this.appendLog(message)
       );
       if (!this.isCurrent(generation)) {
-        connection.close();
+        this.sppServer.stop();
         return;
       }
-      this.connection = connection;
-      this.connectedDeviceName = target.name;
-      this.setState('bluetooth-connected');
-      this.identificationStarted = false;
-      let writeQueue: Promise<void> = Promise.resolve();
-      let writeFailed = false;
-      const link = new Iap2LinkEngine((bytes: Uint8Array) => {
-        const copy = bytes.slice();
-        const operation = writeQueue.then(async (): Promise<void> => {
-          if (!this.isCurrent(generation) || writeFailed) {
-            return;
-          }
-          await connection.write(copy);
-        }).catch((error: Error) => {
-          writeFailed = true;
-          if (this.isCurrent(generation)) {
-            this.failSession(`iAP2 RFCOMM 写入失败：${describeFailure(error)}`);
-          }
-        });
-        writeQueue = operation;
-      });
-      this.linkEngine = link;
-      link.onStateChanged = (state: Iap2LinkState) => this.onLinkState(state, generation);
-      link.onDiagnostic = (direction, packet) => {
-        const payloadBytes = packet.payload === null ? 0 : packet.payload.length;
-        const payloadKind = packet.payload === null ? 'none' :
-          packet.sessionId === 0 ? 'link-sync' : 'iAP2-control';
-        const flags = [
-          (packet.control & 0x80) !== 0 ? 'SYN' : '',
-          (packet.control & 0x40) !== 0 ? 'ACK' : '',
-          (packet.control & 0x10) !== 0 ? 'RESET' : ''
-        ].filter((flag: string) => flag.length > 0).join('|') || 'DATA';
-        this.appendLog(
-          `iAP2 link ${direction} flags=${flags}; control=0x${packet.control.toString(16).padStart(2, '0')}; ` +
-          `seq=${packet.sequence}; ack=${packet.acknowledgement}; session=${packet.sessionId}; ` +
-          `payload=${payloadKind}; payloadBytes=${payloadBytes}。`
-        );
-      };
-      link.onControl = (bytes: Uint8Array) => this.onControlBytes(bytes, generation);
-      connection.onData((data: ArrayBuffer) => {
-        if (this.isCurrent(generation)) {
-          try {
-            link.feed(new Uint8Array(data));
-          } catch (error) {
-            this.failSession(`iAP2 链路解析失败：${describeFailure(error)}`);
-          }
-        }
-      });
-      connection.onClosed((reason: string) => {
-        if (this.isCurrent(generation)) {
-          this.failSession(reason);
-        }
-      });
-      this.appendLog('RFCOMM 通道已就绪，开始 iAP2 链路协商。');
-      this.iap2Timer = setTimeout(() => {
-        this.iap2Timer = undefined;
-        if (this.isCurrent(generation)) {
-          this.failSession('RFCOMM 已连接，但 iAP2 链路协商超时；请结合 first-rx 和接收端日志确认协议收发。');
-        }
-      }, 15000);
-      link.start();
+      this.appendLog('手机 RFCOMM 服务已就绪，等待车机主动建立蓝牙连接。');
     } catch (error) {
       if (!this.isCurrent(generation)) {
         return;
       }
       this.failSession(`${stage}失败：${describeFailure(error)}`);
     }
+  }
+
+  private handleSppConnection(connection: SppConnection, generation: number): void {
+    if (!this.isCurrent(generation)) {
+      connection.close();
+      return;
+    }
+    if (this.connection !== undefined) {
+      const previousConnection = this.connection;
+      this.connection = undefined;
+      const previousLink = this.linkEngine;
+      this.linkEngine = undefined;
+      if (previousLink !== undefined) {
+        previousLink.onStateChanged = undefined;
+        previousLink.close();
+      }
+      this.senderSession?.close();
+      this.senderSession = undefined;
+      if (this.iap2Timer !== undefined) {
+        clearTimeout(this.iap2Timer);
+        this.iap2Timer = undefined;
+      }
+      this.resolveMfiTrust('reject');
+      previousConnection.close();
+    }
+    this.connection = connection;
+    this.connectedDeviceName = connection.deviceName;
+    this.setState('bluetooth-connected');
+    this.identificationStarted = false;
+    let writeQueue: Promise<void> = Promise.resolve();
+    let writeFailed = false;
+    const link = new Iap2LinkEngine((bytes: Uint8Array) => {
+      const copy = bytes.slice();
+      const operation = writeQueue.then(async (): Promise<void> => {
+        if (!this.isCurrent(generation) || writeFailed) {
+          return;
+        }
+        await connection.write(copy);
+      }).catch((error: Error) => {
+        writeFailed = true;
+        if (this.isCurrent(generation) && this.connection === connection) {
+          this.failSession(`iAP2 RFCOMM 写入失败：${describeFailure(error)}`);
+        }
+      });
+      writeQueue = operation;
+    });
+    this.linkEngine = link;
+    link.onStateChanged = (state: Iap2LinkState) => this.onLinkState(state, generation);
+    link.onDiagnostic = (direction, packet) => {
+      const payloadBytes = packet.payload === null ? 0 : packet.payload.length;
+      const payloadKind = packet.payload === null ? 'none' :
+        packet.sessionId === 0 ? 'link-sync' : 'iAP2-control';
+      const flags = [
+        (packet.control & 0x80) !== 0 ? 'SYN' : '',
+        (packet.control & 0x40) !== 0 ? 'ACK' : '',
+        (packet.control & 0x10) !== 0 ? 'RESET' : ''
+      ].filter((flag: string) => flag.length > 0).join('|') || 'DATA';
+      this.appendLog(
+        `iAP2 link ${direction} flags=${flags}; control=0x${packet.control.toString(16).padStart(2, '0')}; ` +
+        `seq=${packet.sequence}; ack=${packet.acknowledgement}; session=${packet.sessionId}; ` +
+        `payload=${payloadKind}; payloadBytes=${payloadBytes}。`
+      );
+    };
+    link.onControl = (bytes: Uint8Array) => this.onControlBytes(bytes, generation);
+    connection.onData((data: ArrayBuffer) => {
+      if (this.isCurrent(generation) && this.connection === connection) {
+        try {
+          link.feed(new Uint8Array(data));
+        } catch (error) {
+          this.failSession(`iAP2 链路解析失败：${describeFailure(error)}`);
+        }
+      }
+    });
+    connection.onClosed((reason: string) => {
+      if (this.isCurrent(generation) && this.connection === connection) {
+        this.failSession(reason);
+      }
+    });
+    this.appendLog('RFCOMM 通道已就绪，开始 iAP2 链路协商。');
+    this.iap2Timer = setTimeout(() => {
+      this.iap2Timer = undefined;
+      if (this.isCurrent(generation) && this.connection === connection) {
+        this.failSession('RFCOMM 已连接，但 iAP2 链路协商超时；请结合 first-rx 和接收端日志确认协议收发。');
+      }
+    }, 15000);
+    link.start();
   }
 
   async startProjection(): Promise<void> {
@@ -514,8 +534,8 @@ class CarPlaySessionController {
   stop(): void {
     this.generation++;
     this.projectionRequest++;
-    this.resolveMfiTrust(false);
-    this.sppClient.stop();
+    this.resolveMfiTrust('reject');
+    this.sppServer.stop();
     this.identityProvider = undefined;
     this.realBluetoothAddress = undefined;
     this.connectedDeviceName = '';
@@ -533,6 +553,15 @@ class CarPlaySessionController {
       this.iap2Timer = undefined;
     }
     const cleanupTasks: Promise<void>[] = [];
+    const releaseInputState = Promise.all([
+      this.touchInput.releaseAll().catch((error: Error) => {
+        this.appendLog(`释放车机触摸状态失败：${describeFailure(error)}`, true);
+      }),
+      this.mediaKeyInput.releaseAll().catch((error: Error) => {
+        this.appendLog(`释放车机媒体键状态失败：${describeFailure(error)}`, true);
+      })
+    ]).then(() => {});
+    cleanupTasks.push(releaseInputState);
     if (this.cleanupPromise !== undefined) {
       cleanupTasks.push(this.cleanupPromise);
     }
@@ -557,6 +586,7 @@ class CarPlaySessionController {
       const virtualDisplay = this.virtualDisplay;
       this.virtualDisplay = undefined;
       cleanupTasks.push((async (): Promise<void> => {
+        await releaseInputState;
         try {
           await mediaSession.close();
         } catch (error) {
@@ -574,11 +604,15 @@ class CarPlaySessionController {
     } else if (this.virtualDisplay !== undefined) {
       const virtualDisplay = this.virtualDisplay;
       this.virtualDisplay = undefined;
-      cleanupTasks.push(virtualDisplay.close().then(() => {
-        this.appendLog('CarPlayer 虚拟窗口与显示器已释放。');
-      }).catch((error: Error) => {
-        this.appendLog(`关闭 CarPlayer 虚拟显示失败：${describeFailure(error)}`, true);
-      }));
+      cleanupTasks.push((async (): Promise<void> => {
+        await releaseInputState;
+        try {
+          await virtualDisplay.close();
+          this.appendLog('CarPlayer 虚拟窗口与显示器已释放。');
+        } catch (error) {
+          this.appendLog(`关闭 CarPlayer 虚拟显示失败：${describeFailure(error)}`, true);
+        }
+      })());
     }
     if (this.mdnsBrowser !== undefined) {
       this.mdnsBrowser.stop((message: string) => this.appendLog(message));
@@ -693,31 +727,31 @@ class CarPlaySessionController {
     }
   }
 
-  approveMfiTrust(fingerprint: string, approved: boolean): void {
+  approveMfiTrust(fingerprint: string, decision: MfiTrustDecision): void {
     if (this.mfiTrustRequest?.fingerprint !== fingerprint) {
       return;
     }
-    this.resolveMfiTrust(approved);
+    this.resolveMfiTrust(decision);
   }
 
-  private requestMfiTrust(info: MfiTrustPromptInfo, generation: number): Promise<boolean> {
+  private requestMfiTrust(info: MfiTrustPromptInfo, generation: number): Promise<MfiTrustDecision> {
     if (!this.isCurrent(generation) || this.mfiTrustResolver !== undefined) {
-      return Promise.resolve(false);
+      return Promise.resolve('reject');
     }
     this.mfiTrustRequest = info;
     this.appendLog(`MFi 证书需要用户确认信任，SHA-256=${info.fingerprint}。`);
     this.notify();
-    return new Promise<boolean>((resolve) => {
+    return new Promise<MfiTrustDecision>((resolve) => {
       this.mfiTrustResolver = resolve;
       this.mfiTrustTimer = setTimeout(() => {
         this.mfiTrustTimer = undefined;
         this.appendLog('等待用户确认 MFi 证书超时；认证已拒绝。', true);
-        this.resolveMfiTrust(false);
+        this.resolveMfiTrust('reject');
       }, 60000);
     });
   }
 
-  private resolveMfiTrust(approved: boolean): void {
+  private resolveMfiTrust(decision: MfiTrustDecision): void {
     const resolve = this.mfiTrustResolver;
     this.mfiTrustResolver = undefined;
     if (this.mfiTrustTimer !== undefined) {
@@ -726,7 +760,7 @@ class CarPlaySessionController {
     }
     this.mfiTrustRequest = undefined;
     if (resolve !== undefined) {
-      resolve(approved);
+      resolve(decision);
       this.notify();
     }
   }
@@ -993,7 +1027,8 @@ class CarPlaySessionController {
         if (this.isCurrent(generation)) {
           this.failSession(`AirPlay 媒体会话异常：${describeFailure(error)}`);
         }
-      }
+      },
+      (command: AirPlayEventCommand) => this.handleAirPlayEventCommand(command)
     ).then((mediaSession: HarmonyAirPlayMediaSession) => {
       if (!this.isCurrent(generation)) {
         void mediaSession.close().catch((error: Error) => {
@@ -1010,6 +1045,55 @@ class CarPlaySessionController {
         this.failSession(`AirPlay 媒体协商失败：${describeFailure(error)}`);
       }
     });
+  }
+
+  private async handleAirPlayEventCommand(command: AirPlayEventCommand): Promise<void> {
+    if (command.kind === 'hid-report') {
+      const interpretation = AirPlayEventProtocol.interpretHidReport(command.report, command.descriptor);
+      if (interpretation.kind === 'touch') {
+        const display = this.virtualDisplay;
+        if (display === undefined) {
+          this.appendLog('收到车机触摸报告，但 CarPlayer 投影屏尚未启动；本次触摸未注入。');
+          return;
+        }
+        if (command.displayWidth === undefined || command.displayHeight === undefined) {
+          throw new Error('车机 /info 未提供触摸坐标映射所需的显示屏尺寸。');
+        }
+        await this.touchInput.applyContacts(
+          display.displayId,
+          display.width,
+          display.height,
+          command.displayWidth,
+          command.displayHeight,
+          interpretation.contacts
+        );
+        this.appendLog(`已向虚拟屏注入 ${interpretation.contacts.length} 个车机触点。`);
+        return;
+      }
+      if (interpretation.kind === 'consumer') {
+        const keys: string[] = [];
+        for (const usage of interpretation.usages) {
+          const keyName = AirPlayEventProtocol.consumerKeyName(usage) ?? `usage-0x${usage.toString(16)}`;
+          const dispatched = await this.mediaKeyInput.dispatchUsage(usage);
+          keys.push(dispatched ? keyName : `${keyName} (ignored)`);
+        }
+        this.appendLog(keys.length === 0
+          ? '收到车机媒体键释放报告。'
+          : `已处理车机媒体键报告：${keys.join(', ')}。`);
+        return;
+      }
+      this.appendLog(`收到无法识别的车机 HID 报告：uuid=${command.uuid}，${command.report.length}B。`);
+      return;
+    }
+    if (command.kind === 'iap-message') {
+      this.appendLog(`收到车机虚拟 iAP2 链路数据 ${command.data.length}B；Harmony 虚拟链路尚未接入。`);
+      return;
+    }
+    if (command.kind === 'force-key-frame') {
+      this.appendLog('车机请求关键帧；当前 Harmony 编码适配器未暴露强制关键帧控制。');
+      return;
+    }
+    this.appendLog(`收到未实现的 AirPlay 事件命令：${command.commandType}。`);
   }
 
   private probeAirPlayEndpoint(endpoint: AirPlayServiceEndpoint, generation: number): void {
@@ -1053,12 +1137,29 @@ class CarPlaySessionController {
 
   private async closeVirtualDisplay(): Promise<void> {
     const virtualDisplay = this.virtualDisplay;
-    if (virtualDisplay === undefined) {
-      return;
-    }
     this.virtualDisplay = undefined;
-    await virtualDisplay.close();
-    this.appendLog('CarPlayer 虚拟窗口与显示器已释放。');
+    const failures: string[] = [];
+    try {
+      await this.touchInput.releaseAll();
+    } catch (error) {
+      failures.push(`释放车机触摸状态失败：${describeFailure(error)}`);
+    }
+    try {
+      await this.mediaKeyInput.releaseAll();
+    } catch (error) {
+      failures.push(`释放车机媒体键状态失败：${describeFailure(error)}`);
+    }
+    if (virtualDisplay !== undefined) {
+      try {
+        await virtualDisplay.close();
+        this.appendLog('CarPlayer 虚拟窗口与显示器已释放。');
+      } catch (error) {
+        failures.push(`关闭 CarPlayer 虚拟显示失败：${describeFailure(error)}`);
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(failures.join('；'));
+    }
   }
 
   private setState(state: CarPlaySessionState): void {

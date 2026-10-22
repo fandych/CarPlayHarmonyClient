@@ -5,7 +5,9 @@ import { Iap2LinkEngine } from '../main/ets/protocol/iap2/Iap2LinkEngine';
 import { BinaryPlist } from '../main/ets/protocol/airplay/BinaryPlist';
 import { RtspResponseParser } from '../main/ets/protocol/airplay/RtspResponseParser';
 import { Iap2SenderSession, parseCarPlayStartSession } from '../main/ets/protocol/iap2/Iap2SenderSession';
-import { classifyMfiPkixTrustFailure } from '../main/ets/protocol/iap2/MfiVerifier';
+import {
+  classifyMfiPkixTrustFailure, mfiChallengeSignatureAlgorithms, mfiTrustFingerprintToPersist
+} from '../main/ets/protocol/iap2/MfiVerifier';
 import {
   DeterministicMfiVerifier, authenticateTestAccessory, csmMessages, deterministicTestRandomBytes
 } from './Iap2MfiTestSupport';
@@ -151,6 +153,33 @@ export default function iap2ProtocolTest(): void {
         car.feed(pending[index]);
       }
       expect(received).assertEqual(0x00);
+    });
+
+    it('echoes the vehicle synchronization payload in the main-branch SYN response', 0, () => {
+      const sent: Uint8Array[] = [];
+      const phone = new Iap2LinkEngine((bytes: Uint8Array) => sent.push(bytes));
+      phone.start();
+      sent.splice(0, sent.length);
+      const vehicleSync = new Uint8Array([
+        0x01, 0x04, 0xff, 0xff, 0x0f, 0xa0, 0x01, 0xf4, 0x04, 0x03,
+        0x0a, 0x00, 0x02, 0x0b, 0x02, 0x01, 0x0c, 0x01, 0x02
+      ]);
+      phone.feed(Iap2LinkPacket.encode({
+        control: 0x80,
+        sequence: 17,
+        acknowledgement: 0,
+        sessionId: 0,
+        payload: vehicleSync
+      }));
+
+      expect(phone.state).assertEqual('normal');
+      expect(sent.length).assertEqual(1);
+      const responseBytes = sent[0]?.slice(6);
+      const response = responseBytes === undefined ? null : Iap2LinkPacket.decode(responseBytes);
+      expect(response?.control).assertEqual(0xc0);
+      expect(response?.acknowledgement).assertEqual(17);
+      expect(response?.payload?.[1]).assertEqual(0x7f);
+      expect(response?.payload?.[0]).assertEqual(vehicleSync[0]);
     });
 
     it('parses AirPlay Binary Plist dictionaries, unsigned values, arrays and UTF-16', 0, () => {
@@ -420,16 +449,34 @@ export default function iap2ProtocolTest(): void {
       session.close();
     });
 
-    it('prompts only for eligible issuer trust failures', 0, () => {
+    it('prompts for any parsed-certificate PKIX failure and only persists an always decision', 0, () => {
       const fingerprint = 'a'.repeat(64);
       expect(classifyMfiPkixTrustFailure('unable to get local issuer certificate', fingerprint, []))
         .assertEqual('prompt-for-pin');
       expect(classifyMfiPkixTrustFailure('certificate has expired', fingerprint, []))
-        .assertEqual('reject');
+        .assertEqual('prompt-for-pin');
       expect(classifyMfiPkixTrustFailure('key cannot be used for a digital signature', fingerprint, []))
-        .assertEqual('reject');
+        .assertEqual('prompt-for-pin');
       expect(classifyMfiPkixTrustFailure('untrusted certificate', fingerprint, [fingerprint]))
         .assertEqual('already-pinned');
+      expect(classifyMfiPkixTrustFailure('', fingerprint, [])).assertEqual('reject');
+      expect(mfiTrustFingerprintToPersist('reject', fingerprint)).assertEqual('');
+      expect(mfiTrustFingerprintToPersist('once', fingerprint)).assertEqual('');
+      expect(mfiTrustFingerprintToPersist('always', fingerprint)).assertEqual(fingerprint);
+    });
+
+    it('selects challenge signature algorithms from the imported certificate key type', 0, () => {
+      const rsa = mfiChallengeSignatureAlgorithms('RSA2048');
+      expect(rsa.length).assertEqual(2);
+      expect(rsa[0]).assertEqual('RSA|PKCS1|SHA256');
+      expect(rsa[1]).assertEqual('RSA|PKCS1|SHA1');
+
+      const ecc = mfiChallengeSignatureAlgorithms('ECC256');
+      expect(ecc.length).assertEqual(2);
+      expect(ecc[0]).assertEqual('ECC|SHA256');
+      expect(ecc[1]).assertEqual('ECC|SHA1');
+      expect(mfiChallengeSignatureAlgorithms('Ed25519')[0]).assertEqual('Ed25519');
+      expect(mfiChallengeSignatureAlgorithms('unknown').length).assertEqual(0);
     });
   });
 }

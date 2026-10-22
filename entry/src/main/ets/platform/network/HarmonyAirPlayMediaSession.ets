@@ -8,6 +8,13 @@ import {
   AirPlaySenderMetadata
 } from '../../protocol/airplay/AirPlayMediaSetupProtocol';
 import { AirPlayMediaPacketCodec } from '../../protocol/airplay/AirPlayMediaPacketCodec';
+import {
+  AirPlayEventCommand, AirPlayEventProtocol, AirPlayHidDevice, AirPlayReceiverDisplayInfo
+} from '../../protocol/airplay/AirPlayEventProtocol';
+import {
+  AirPlayAudioProfile, AirPlayAudioProfileProtocol
+} from '../../protocol/airplay/AirPlayAudioProfileProtocol';
+import { HarmonyAirPlayAudioDataChannel } from './HarmonyAirPlayAudioDataChannel';
 import { HarmonyAirPlayCrypto } from '../../protocol/airplay/HarmonyAirPlayCrypto';
 import { AirPlayServiceEndpoint } from './HarmonyMdnsBrowser';
 import { AirPlayVerifiedRtspSession, HarmonyAirPlayClient } from './HarmonyAirPlayClient';
@@ -25,17 +32,20 @@ const VIDEO_KEEP_ALIVE_INTERVAL_MS = 1000;
 class MediaScreenCaptureCallbacks implements HarmonyAirPlayScreenCaptureCallbacks {
   readonly onCodecData: (data: Uint8Array) => Promise<void>;
   readonly onFrame: (data: Uint8Array, timestamp: number) => Promise<void>;
+  readonly onAudioFrame: (data: Uint8Array, timestamp: number) => Promise<void>;
   readonly onState: (state: number) => void;
   readonly onError: (error: Error) => void;
 
   constructor(
     onCodecData: (data: Uint8Array) => Promise<void>,
     onFrame: (data: Uint8Array, timestamp: number) => Promise<void>,
+    onAudioFrame: (data: Uint8Array, timestamp: number) => Promise<void>,
     onState: (state: number) => void,
     onError: (error: Error) => void
   ) {
     this.onCodecData = onCodecData;
     this.onFrame = onFrame;
+    this.onAudioFrame = onAudioFrame;
     this.onState = onState;
     this.onError = onError;
   }
@@ -135,6 +145,8 @@ export class HarmonyAirPlayMediaSession {
   private readonly videoStreamKey: Uint8Array;
   private readonly timingServer: HarmonyAirPlayTimingServer;
   private readonly videoDataChannel: HarmonyAirPlayVideoDataChannel;
+  private readonly audioDataChannel: HarmonyAirPlayAudioDataChannel | undefined;
+  private readonly audioProfile: AirPlayAudioProfile | undefined;
   private readonly eventChannel: HarmonyAirPlayEventChannel | undefined;
   private readonly keepAliveClient: HarmonyAirPlayKeepAliveClient | undefined;
   private screenCapture: HarmonyAirPlayScreenCapture | undefined = undefined;
@@ -156,6 +168,8 @@ export class HarmonyAirPlayMediaSession {
     videoStreamKey: Uint8Array,
     timingServer: HarmonyAirPlayTimingServer,
     videoDataChannel: HarmonyAirPlayVideoDataChannel,
+    audioDataChannel: HarmonyAirPlayAudioDataChannel | undefined,
+    audioProfile: AirPlayAudioProfile | undefined,
     eventChannel: HarmonyAirPlayEventChannel | undefined,
     keepAliveClient: HarmonyAirPlayKeepAliveClient | undefined,
     log: (message: string) => void,
@@ -169,6 +183,8 @@ export class HarmonyAirPlayMediaSession {
     this.videoStreamKey = videoStreamKey;
     this.timingServer = timingServer;
     this.videoDataChannel = videoDataChannel;
+    this.audioDataChannel = audioDataChannel;
+    this.audioProfile = audioProfile;
     this.eventChannel = eventChannel;
     this.keepAliveClient = keepAliveClient;
     this.log = log;
@@ -182,14 +198,17 @@ export class HarmonyAirPlayMediaSession {
     senderMetadata: AirPlaySenderMetadata,
     log: (message: string) => void,
     isActive: () => boolean,
-    onError: (error: Error) => void = (error: Error) => log(`AirPlay media session failed: ${error.message}`)
+    onError: (error: Error) => void = (error: Error) => log(`AirPlay media session failed: ${error.message}`),
+    onEventCommand: (command: AirPlayEventCommand) => Promise<void> | void = () => {}
   ): Promise<HarmonyAirPlayMediaSession> {
     const client = new HarmonyAirPlayClient();
     const verifiedSession = await client.openVerifiedSession(context, endpoint, log);
     const timingServer = new HarmonyAirPlayTimingServer(log);
     let videoDataChannel: HarmonyAirPlayVideoDataChannel | undefined = undefined;
+    let audioDataChannel: HarmonyAirPlayAudioDataChannel | undefined = undefined;
     let eventChannel: HarmonyAirPlayEventChannel | undefined = undefined;
     let keepAliveClient: HarmonyAirPlayKeepAliveClient | undefined = undefined;
+    let audioProfile: AirPlayAudioProfile | undefined = undefined;
     try {
       HarmonyAirPlayMediaSession.requireActive(isActive);
       const infoResponse = await verifiedSession.request('GET', '/info');
@@ -197,7 +216,18 @@ export class HarmonyAirPlayMediaSession {
       if (infoResponse.statusCode !== 200) {
         throw new Error(`Verified AirPlay /info request returned ${infoResponse.statusCode}.`);
       }
-      const displayUuid = HarmonyAirPlayMediaSession.readDisplayUuid(infoResponse.body);
+      const displayInfo = HarmonyAirPlayMediaSession.readDisplayInfo(infoResponse.body);
+      const displayUuid = displayInfo.uuid;
+      const hidDevices = AirPlayEventProtocol.readHidDevices(infoResponse.body);
+      log(`AirPlay /info exposed ${hidDevices.length} HID device(s).`);
+      const audioProfiles = AirPlayAudioProfileProtocol.readAacCandidates(infoResponse.body);
+      audioProfile = audioProfiles.length > 0 ? audioProfiles[0] : undefined;
+      if (audioProfile === undefined) {
+        log('AirPlay /info did not advertise an AAC-LC media profile; external playback audio will not be captured.');
+      } else {
+        log(`AirPlay selected AAC-LC media profile: type=${audioProfile.streamType}, ` +
+          `rate=${audioProfile.sampleRate}, latency=${audioProfile.latencyMs}ms.`);
+      }
       const timingPort = await timingServer.start();
       HarmonyAirPlayMediaSession.requireActive(isActive);
       const sessionUuid = await HarmonyAirPlayMediaSession.randomUuid();
@@ -227,7 +257,10 @@ export class HarmonyAirPlayMediaSession {
           initialSetupInfo.eventPort,
           verifiedSession.controlKeys.sharedSecret,
           log,
-          onError
+          onError,
+          (command: AirPlayEventCommand) => onEventCommand(
+            AirPlayEventProtocol.enrichCommand(command, hidDevices, displayInfo)
+          )
         );
         HarmonyAirPlayMediaSession.requireActive(isActive);
       } else {
@@ -241,6 +274,19 @@ export class HarmonyAirPlayMediaSession {
         HarmonyAirPlayMediaSession.requireActive(isActive);
       } else {
         log('AirPlay initial SETUP omitted keepAlivePort; no UDP keep-alive was started.');
+      }
+
+      const modesResponse = await verifiedSession.request(
+        'POST',
+        '/command',
+        BinaryPlist.encode(AirPlayEventProtocol.buildModesChangedCommand()),
+        [{ name: 'Content-Type', value: PLIST_CONTENT_TYPE }]
+      );
+      HarmonyAirPlayMediaSession.requireActive(isActive);
+      if (modesResponse.statusCode === 200) {
+        log('AirPlay modesChanged accepted; sender reserved main display and audio resources.');
+      } else {
+        log(`AirPlay modesChanged returned ${modesResponse.statusCode}; continuing for receiver compatibility.`);
       }
 
       const screenResponse = await verifiedSession.request(
@@ -275,6 +321,19 @@ export class HarmonyAirPlayMediaSession {
       if (recordResponse.statusCode !== 200) {
         throw new Error(`AirPlay RECORD returned ${recordResponse.statusCode}.`);
       }
+      if (audioProfile !== undefined) {
+        audioDataChannel = await HarmonyAirPlayMediaSession.establishAudioDataChannel(
+          verifiedSession,
+          endpoint.host,
+          audioProfile,
+          log,
+          isActive
+        );
+        HarmonyAirPlayMediaSession.requireActive(isActive);
+        if (audioDataChannel === undefined) {
+          audioProfile = undefined;
+        }
+      }
       const videoStreamKey = await AirPlayMediaPacketCodec.deriveVideoStreamKey(
         verifiedSession.controlKeys.sharedSecret,
         connectionId
@@ -292,17 +351,43 @@ export class HarmonyAirPlayMediaSession {
         videoStreamKey,
         timingServer,
         videoDataChannel,
+        audioDataChannel,
+        audioProfile,
         eventChannel,
         keepAliveClient,
         log,
         onError
       );
+      if (eventChannel !== undefined) {
+        for (const device of hidDevices) {
+          if (device.descriptor === undefined || !AirPlayEventProtocol.isTouchDescriptor(device.descriptor)) {
+            continue;
+          }
+          if (audioDataChannel !== undefined && audioProfile !== undefined) {
+            log(`AirPlay AAC audio stream active: type=${audioProfile.streamType}, dataPort negotiated.`);
+          }
+          try {
+            await eventChannel.sendCommand(AirPlayEventProtocol.buildHidSetInputModeCommand(device.uuid));
+            log(`AirPlay touch HID input mode enabled for device ${device.uuid}.`);
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            log(`Unable to enable AirPlay touch HID input for device ${device.uuid}: ${detail}`);
+          }
+        }
+      }
       mediaSession.scheduleFeedback();
       mediaSession.scheduleVideoKeepAlive();
       log(`AirPlay screen session active: display=${displayUuid}, dataPort=${videoPorts.dataPort}.`);
       return mediaSession;
     } catch (error) {
       const cleanupErrors: string[] = [];
+      if (audioDataChannel !== undefined) {
+        try {
+          await audioDataChannel.close();
+        } catch (closeError) {
+          cleanupErrors.push(closeError instanceof Error ? closeError.message : String(closeError));
+        }
+      }
       if (eventChannel !== undefined) {
         try {
           await eventChannel.close();
@@ -340,6 +425,82 @@ export class HarmonyAirPlayMediaSession {
         log(`AirPlay media-session rollback errors: ${cleanupErrors.join('; ')}`);
       }
       throw new Error(`Failed to establish AirPlay screen session: ${detail}`);
+    }
+  }
+
+  private static async establishAudioDataChannel(
+    session: AirPlayVerifiedRtspSession,
+    host: string,
+    profile: AirPlayAudioProfile,
+    log: (message: string) => void,
+    isActive: () => boolean
+  ): Promise<HarmonyAirPlayAudioDataChannel | undefined> {
+    let channel: HarmonyAirPlayAudioDataChannel | undefined = undefined;
+    try {
+      const connectionId = await HarmonyAirPlayMediaSession.randomConnectionId();
+      const response = await session.request(
+        'SETUP',
+        '/',
+        AirPlayMediaSetupProtocol.buildAudioSetupBody({
+          streamType: profile.streamType,
+          streamConnectionId: connectionId,
+          audioFormat: profile.audioFormat,
+          audioType: profile.audioType,
+          latencyMs: profile.latencyMs,
+          supportsHighAccuracyTimestamps: true,
+          samplesPerFrame: profile.samplesPerFrame
+        }),
+        [{ name: 'Content-Type', value: PLIST_CONTENT_TYPE }]
+      );
+      HarmonyAirPlayMediaSession.requireActive(isActive);
+      if (response.statusCode !== 200) {
+        throw new Error(`AAC audio SETUP returned ${response.statusCode}.`);
+      }
+      const ports = AirPlayMediaSetupProtocol.parseStreamPorts(response.body, profile.streamType);
+      const streamKey = await AirPlayMediaPacketCodec.deriveVideoStreamKey(
+        session.controlKeys.sharedSecret,
+        connectionId
+      );
+      try {
+        channel = new HarmonyAirPlayAudioDataChannel(
+          host,
+          ports.dataPort,
+          ports.controlPort,
+          profile,
+          streamKey,
+          log
+        );
+      } finally {
+        streamKey.fill(0);
+      }
+      await channel.start();
+      HarmonyAirPlayMediaSession.requireActive(isActive);
+      const recordResponse = await session.request(
+        'RECORD',
+        '/',
+        AirPlayMediaSetupProtocol.buildRecordBody(),
+        [{ name: 'Content-Type', value: PLIST_CONTENT_TYPE }]
+      );
+      HarmonyAirPlayMediaSession.requireActive(isActive);
+      if (recordResponse.statusCode !== 200) {
+        throw new Error(`AirPlay audio RECORD returned ${recordResponse.statusCode}.`);
+      }
+      if (ports.controlPort === 0) {
+        log('AirPlay AAC audio stream has no controlPort; audio sync packets are unavailable.');
+      }
+      return channel;
+    } catch (error) {
+      if (channel !== undefined) {
+        try {
+          await channel.close();
+        } catch (closeError) {
+          log(`AAC audio setup rollback failed: ${closeError instanceof Error ? closeError.message : String(closeError)}`);
+        }
+      }
+      log(`AAC audio stream could not be established; video remains available: ${
+        error instanceof Error ? error.message : String(error)
+      }`);
+      return undefined;
     }
   }
 
@@ -420,6 +581,12 @@ export class HarmonyAirPlayMediaSession {
           onFirstFrame();
         }
       },
+      async (data: Uint8Array, _timestamp: number): Promise<void> => {
+        const audioChannel = this.audioDataChannel;
+        if (audioChannel !== undefined) {
+          await audioChannel.sendFrame(data);
+        }
+      },
       (state: number): void => {
         if (state === 0) {
           this.log('System screen-capture authorization granted; waiting for H.264 frames.');
@@ -433,7 +600,13 @@ export class HarmonyAirPlayMediaSession {
       },
       (error: Error): void => this.reportError(error)
     );
-    const capture = new HarmonyAirPlayScreenCapture(width, height, displayId, callbacks);
+    const capture = new HarmonyAirPlayScreenCapture(
+      width,
+      height,
+      displayId,
+      this.audioProfile?.sampleRate ?? 0,
+      callbacks
+    );
     this.screenCapture = capture;
     try {
       capture.start();
@@ -474,6 +647,13 @@ export class HarmonyAirPlayMediaSession {
       this.screenCapture = undefined;
       try {
         await capture.stop();
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (this.audioDataChannel !== undefined) {
+      try {
+        await this.audioDataChannel.close();
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
       }
@@ -571,7 +751,7 @@ export class HarmonyAirPlayMediaSession {
     this.onError(error);
   }
 
-  private static readDisplayUuid(body: Uint8Array): string {
+  private static readDisplayInfo(body: Uint8Array): AirPlayReceiverDisplayInfo {
     const root = BinaryPlist.parse(body);
     if (!(root instanceof Map)) {
       throw new Error('AirPlay /info response is not a Binary Plist dictionary.');
@@ -585,15 +765,25 @@ export class HarmonyAirPlayMediaSession {
         continue;
       }
       const uuid = item.get('uuid');
+      const width = item.get('widthPixels');
+      const height = item.get('heightPixels');
+      const geometry: AirPlayReceiverDisplayInfo = {
+        uuid: '',
+        width: typeof width === 'number' && Number.isSafeInteger(width) && width > 0 ? width : undefined,
+        height: typeof height === 'number' && Number.isSafeInteger(height) && height > 0 ? height : undefined
+      };
       if (typeof uuid === 'string' && uuid.trim().length > 0) {
-        return uuid;
+        geometry.uuid = uuid;
+        return geometry;
       }
       if (uuid instanceof Uint8Array && uuid.length === 16) {
         const hex = Array.from(uuid, (byte: number) => byte.toString(16).padStart(2, '0')).join('');
-        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+        geometry.uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+        return geometry;
       }
       if (typeof uuid === 'number' && Number.isSafeInteger(uuid)) {
-        return `${uuid}`;
+        geometry.uuid = `${uuid}`;
+        return geometry;
       }
     }
     throw new Error('AirPlay /info displays did not contain a usable display UUID.');

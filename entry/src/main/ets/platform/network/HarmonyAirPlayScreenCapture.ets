@@ -1,4 +1,4 @@
-import nativeScreenCapture, { ScreenCaptureEvent } from 'libentry.so';
+import nativeScreenCapture, { ScreenCaptureAudioBuffer, ScreenCaptureEvent } from 'libentry.so';
 import { AirPlayMediaPacketCodec } from '../../protocol/airplay/AirPlayMediaPacketCodec';
 
 const CODEC_DATA_FLAG = 1 << 3;
@@ -9,6 +9,7 @@ const MAX_PENDING_CAPTURE_EVENTS = 8;
 export interface HarmonyAirPlayScreenCaptureCallbacks {
   onCodecData(data: Uint8Array): Promise<void>;
   onFrame(data: Uint8Array, timestamp: number): Promise<void>;
+  onAudioFrame?(data: Uint8Array, timestamp: number): Promise<void>;
   onState(state: number): void;
   onError(error: Error): void;
 }
@@ -17,15 +18,20 @@ export class HarmonyAirPlayScreenCapture {
   private readonly width: number;
   private readonly height: number;
   private readonly displayId: number;
+  private readonly audioSampleRate: number;
   private readonly callbacks: HarmonyAirPlayScreenCaptureCallbacks;
   private processing: Promise<void> = Promise.resolve();
+  private audioProcessing: Promise<void> = Promise.resolve();
   private pendingEvents: number = 0;
+  private pendingAudioEvents: number = 0;
   private codecDataFragments: Uint8Array[] = [];
   private pendingCodecUnits: Uint8Array[] = [];
   private videoFrameFragments: Uint8Array[] = [];
+  private audioFrameFragments: Uint8Array[] = [];
   private codecDataLength: number = 0;
   private pendingCodecLength: number = 0;
   private videoFrameLength: number = 0;
+  private audioFrameLength: number = 0;
   private started: boolean = false;
   private failed: boolean = false;
   private closed: boolean = false;
@@ -34,11 +40,13 @@ export class HarmonyAirPlayScreenCapture {
     width: number,
     height: number,
     displayId: number,
+    audioSampleRate: number,
     callbacks: HarmonyAirPlayScreenCaptureCallbacks
   ) {
     this.width = width;
     this.height = height;
     this.displayId = displayId;
+    this.audioSampleRate = audioSampleRate;
     this.callbacks = callbacks;
   }
 
@@ -46,9 +54,13 @@ export class HarmonyAirPlayScreenCapture {
     if (this.closed || this.failed || this.started) {
       throw new Error('HarmonyOS screen capture is already started or closed.');
     }
-    nativeScreenCapture.startCapture(this.width, this.height, this.displayId, (event: ScreenCaptureEvent) => {
-      this.enqueue(event);
-    });
+    nativeScreenCapture.startCapture(
+      this.width,
+      this.height,
+      this.displayId,
+      this.audioSampleRate,
+      (event: ScreenCaptureEvent) => this.enqueue(event)
+    );
     this.started = true;
   }
 
@@ -61,7 +73,7 @@ export class HarmonyAirPlayScreenCapture {
       this.started = false;
     }
     this.closed = true;
-    await this.processing;
+    await Promise.all([this.processing, this.audioProcessing]);
     this.clearFragments();
   }
 
@@ -70,11 +82,16 @@ export class HarmonyAirPlayScreenCapture {
       this.clearEvent(event);
       return;
     }
-    if (this.pendingEvents >= MAX_PENDING_CAPTURE_EVENTS) {
-      this.clearEvent(event);
-      this.fail(new Error('The H.264 processing queue is overloaded; screen sharing was stopped.'));
+    if (event.kind === 'audio') {
+      this.enqueueAudio(event);
       return;
     }
+    if (this.pendingEvents >= MAX_PENDING_CAPTURE_EVENTS) {
+      this.clearEvent(event);
+      this.fail(new Error('The video processing queue is overloaded; screen sharing was stopped.'));
+      return;
+    }
+
     this.pendingEvents++;
     this.processing = this.processing.then(async (): Promise<void> => {
       try {
@@ -91,8 +108,30 @@ export class HarmonyAirPlayScreenCapture {
     });
   }
 
+  private enqueueAudio(event: ScreenCaptureAudioBuffer): void {
+    if (this.pendingAudioEvents >= MAX_PENDING_CAPTURE_EVENTS) {
+      this.clearEvent(event);
+      this.fail(new Error('The internal audio processing queue is overloaded; screen sharing was stopped.'));
+      return;
+    }
+    this.pendingAudioEvents++;
+    this.audioProcessing = this.audioProcessing.then(async (): Promise<void> => {
+      try {
+        if (this.closed || this.failed) {
+          this.clearEvent(event);
+        } else {
+          await this.consumeAudio(event);
+        }
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        this.pendingAudioEvents--;
+      }
+    });
+  }
+
   private clearEvent(event: ScreenCaptureEvent): void {
-    if (event.kind === 'buffer') {
+    if (event.kind === 'buffer' || event.kind === 'audio') {
       new Uint8Array(event.data).fill(0);
     }
   }
@@ -131,7 +170,11 @@ export class HarmonyAirPlayScreenCapture {
       throw new Error(`HarmonyOS screen capture failed with code ${event.code}.`);
     }
     if (event.kind === 'overflow') {
-      throw new Error(`The H.264 callback queue overflowed and dropped ${event.dropped} encoded buffers.`);
+      throw new Error(`The screen media callback queue overflowed and dropped ${event.dropped} encoded buffers.`);
+    }
+    if (event.kind === 'audio') {
+      await this.consumeAudio(event);
+      return;
     }
 
     const eventBytes = new Uint8Array(event.data);
@@ -205,6 +248,29 @@ export class HarmonyAirPlayScreenCapture {
     }
   }
 
+  private async consumeAudio(event: ScreenCaptureAudioBuffer): Promise<void> {
+    const eventBytes = new Uint8Array(event.data);
+    const data = eventBytes.slice();
+    eventBytes.fill(0);
+    if (data.length === 0 || (event.flags & CODEC_DATA_FLAG) !== 0) {
+      data.fill(0);
+      return;
+    }
+    this.audioFrameFragments.push(data);
+    this.audioFrameLength += data.length;
+    this.requireFragmentLimit(this.audioFrameLength);
+    if ((event.flags & INCOMPLETE_FRAME_FLAG) === 0) {
+      const frame = this.joinFragments(this.audioFrameFragments, this.audioFrameLength);
+      this.audioFrameFragments = [];
+      this.audioFrameLength = 0;
+      try {
+        await this.callbacks.onAudioFrame?.(frame, event.timestamp);
+      } finally {
+        frame.fill(0);
+      }
+    }
+  }
+
   private joinFragments(fragments: Uint8Array[], length: number): Uint8Array {
     const result = new Uint8Array(length);
     let offset = 0;
@@ -235,10 +301,13 @@ export class HarmonyAirPlayScreenCapture {
   private clearFragments(): void {
     this.codecDataFragments.forEach((fragment: Uint8Array) => fragment.fill(0));
     this.videoFrameFragments.forEach((fragment: Uint8Array) => fragment.fill(0));
+    this.audioFrameFragments.forEach((fragment: Uint8Array) => fragment.fill(0));
     this.clearPendingCodecUnits();
     this.codecDataFragments = [];
     this.videoFrameFragments = [];
+    this.audioFrameFragments = [];
     this.codecDataLength = 0;
     this.videoFrameLength = 0;
+    this.audioFrameLength = 0;
   }
 }

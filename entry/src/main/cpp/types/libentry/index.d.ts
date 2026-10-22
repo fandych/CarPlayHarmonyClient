@@ -5,6 +5,13 @@ export interface ScreenCaptureBuffer {
   timestamp: number;
 }
 
+export interface ScreenCaptureAudioBuffer {
+  kind: 'audio';
+  data: ArrayBuffer;
+  flags: number;
+  timestamp: number;
+}
+
 export interface ScreenCaptureState {
   kind: 'state';
   state: number;
@@ -21,10 +28,10 @@ export interface ScreenCaptureOverflow {
 }
 
 export type ScreenCaptureEvent =
-  ScreenCaptureBuffer | ScreenCaptureState | ScreenCaptureError | ScreenCaptureOverflow;
+  ScreenCaptureBuffer | ScreenCaptureAudioBuffer | ScreenCaptureState | ScreenCaptureError | ScreenCaptureOverflow;
 
 export interface NativeScreenCapture {
-  startCapture(width: number, height: number, displayId: number,
+  startCapture(width: number, height: number, displayId: number, audioSampleRate: number,
     callback: (event: ScreenCaptureEvent) => void): void;
   stopCapture(): void;
   createVirtualSurface(width: number, height: number): string;

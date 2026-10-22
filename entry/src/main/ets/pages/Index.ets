@@ -2,15 +2,13 @@ import { carPlaySessionController, CarPlaySessionState, isCarPlaySessionActive }
 import { CarPlayTheme } from '../app/settings/CarPlaySettings';
 import { carPlaySettings } from '../platform/settings/HarmonySettings';
 import { showPageError } from '../components/PageHeader';
-import { MfiTrustPromptInfo } from '../protocol/iap2/MfiVerifier';
+import { MfiTrustDecision, MfiTrustPromptInfo } from '../protocol/iap2/MfiVerifier';
 
 @Entry
 @Component
 struct Index {
   @State private state: CarPlaySessionState = 'idle';
   @State private deviceName: string = '';
-  @State private selectedDeviceName: string = '';
-  @State private selectedDeviceId: string = '';
   @State private carPlayEnabled: boolean = false;
   @State private ready: boolean = false;
   @State private busy: boolean = false;
@@ -35,8 +33,6 @@ struct Index {
     });
     this.unsubscribeSettings = carPlaySettings.subscribe((snapshot) => {
       this.carPlayEnabled = snapshot.settings.enabled;
-      this.selectedDeviceName = snapshot.settings.targetDeviceName;
-      this.selectedDeviceId = snapshot.settings.targetDeviceId;
       this.ready = snapshot.ready;
       this.busy = snapshot.busy;
       this.theme = snapshot.settings.theme;
@@ -46,7 +42,7 @@ struct Index {
 
   aboutToDisappear(): void {
     if (this.presentedMfiTrustFingerprint.length > 0) {
-      carPlaySessionController.approveMfiTrust(this.presentedMfiTrustFingerprint, false);
+      carPlaySessionController.approveMfiTrust(this.presentedMfiTrustFingerprint, 'reject');
       this.presentedMfiTrustFingerprint = '';
     }
     this.unsubscribeSession?.();
@@ -59,17 +55,23 @@ struct Index {
     try {
       const response = await this.getUIContext().getPromptAction().showDialog({
         title: '确认车机 MFi 证书信任',
-        message: `系统无法验证此证书的颁发链。只有在你确认正在连接自己的车机/DiPlay 时才信任。\n\n` +
+        message: `系统无法验证此 MFi 证书。只有在你确认正在连接自己的车机/DiPlay 时才继续。\n\n` +
           `主体：${info.subject}\n颁发者：${info.issuer}\nSHA-256：${info.fingerprint}\n\n` +
-          `${info.pkixFailure}\n\n同意后仅在本机保存此指纹；仍会验证 MFi challenge 签名。`,
+          `${info.pkixFailure}\n\n` +
+          '选择信任会覆盖系统对该证书链、有效期和用途的校验；无法解析的证书仍会拒绝。' +
+          '无论选择“一次”还是“始终”，每次连接仍必须通过 MFi challenge 签名验证。' +
+          '“一次”不保存；“始终”仅在签名验证成功后保存到本应用。',
         buttons: [
           { text: '拒绝', color: '#666666' },
-          { text: '信任此证书', color: '#007DFF' }
+          { text: '一次', color: '#007DFF' },
+          { text: '始终', color: '#B15B00' }
         ]
       });
-      carPlaySessionController.approveMfiTrust(info.fingerprint, response.index === 1);
+      const decision: MfiTrustDecision = response.index === 1 ? 'once' :
+        response.index === 2 ? 'always' : 'reject';
+      carPlaySessionController.approveMfiTrust(info.fingerprint, decision);
     } catch (error) {
-      carPlaySessionController.approveMfiTrust(info.fingerprint, false);
+      carPlaySessionController.approveMfiTrust(info.fingerprint, 'reject');
       showPageError(this.getUIContext(), 'MFi 证书信任确认', error);
     } finally {
       if (this.presentedMfiTrustFingerprint === info.fingerprint) {
@@ -96,10 +98,6 @@ struct Index {
     if (!this.ready || this.busy) {
       return;
     }
-    if (this.selectedDeviceId.length === 0 || this.selectedDeviceName.length === 0) {
-      this.openDevicePicker();
-      return;
-    }
     if (isCarPlaySessionActive(this.state)) {
       return;
     }
@@ -122,7 +120,7 @@ struct Index {
 
   private statusDetail(): string {
     switch (this.state) {
-      case 'connecting': return '正在连接所选接收端，或等待接收端回连';
+      case 'connecting': return '手机已启动安全蓝牙监听，等待车机主动连接';
       case 'bluetooth-connected': return '蓝牙通道已连接，CarPlay 尚未建立';
       case 'iap2-negotiating': return '正在协商 iAP2 链路，CarPlay 尚未建立';
       case 'iap2-ready': return 'iAP2 已就绪，等待车机网络信息';
@@ -136,7 +134,7 @@ struct Index {
       case 'streaming': return '屏幕采集已授权，正在向接收端发送视频帧';
       case 'blocked': return this.blockedReason;
       case 'error': return '连接失败，开启意图已保留；请查看日志或修改设置后重试';
-      default: return this.carPlayEnabled ? '已记住开启状态，当前未连接' : '开启后连接已保存的接收端';
+      default: return this.carPlayEnabled ? '已记住开启状态，当前未连接' : '开启后等待车机主动连接';
     }
   }
 
@@ -223,7 +221,7 @@ struct Index {
               Text('设备')
                 .fontSize(18)
                 .fontColor($r('app.color.primary_text'))
-              Text(this.selectedDeviceName.length > 0 ? this.selectedDeviceName : '选择接收端')
+              Text(this.deviceName.length > 0 ? this.deviceName : '车机主动连接')
                 .fontSize(15)
                 .fontColor($r('app.color.secondary_text'))
                 .maxLines(1)
@@ -232,10 +230,10 @@ struct Index {
             }
             .layoutWeight(1)
             .height('100%')
-            .accessibilityText('设备，点击选择接收端')
+            .accessibilityText('可选设备信息，点击选择已配对设备')
             .onClick(() => this.openDevicePicker())
-            Button(this.selectedDeviceId.length === 0 ? '选择' :
-              isCarPlaySessionActive(this.state) ? '已连接' : '连接')
+            Button(this.state === 'connecting' ? '等待中' :
+              isCarPlaySessionActive(this.state) ? '已连接' : '启动监听')
               .enabled(this.ready && !this.busy && !isCarPlaySessionActive(this.state))
               .onClick(() => this.connectOrChooseDevice())
           }

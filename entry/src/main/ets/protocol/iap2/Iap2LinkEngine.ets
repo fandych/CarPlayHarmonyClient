@@ -182,20 +182,21 @@ export class Iap2LinkEngine {
       this.receiveSequence = packet.sequence;
 
       if ((packet.control & ACKNOWLEDGEMENT) === 0) {
-        const echo = localSynchronization(synchronization.sessions);
-        echo.maxOutgoing = 0x7F;
+        const echo = packet.payload?.slice();
+        if (echo === undefined || echo === null) {
+          return;
+        }
+        echo[1] = 0x7F;
         this.transmitSequence = nextSequence(this.transmitSequence);
         this.writePacket({
           control: SYNCHRONIZE | ACKNOWLEDGEMENT,
           sequence: this.transmitSequence,
           acknowledgement: packet.sequence,
           sessionId: 0,
-          payload: encodeSynchronization(echo)
+          payload: echo
         }, true);
-      } else {
-        this.sendAcknowledgement();
-        this.setState('normal');
       }
+      this.setState('normal');
       return;
     }
 

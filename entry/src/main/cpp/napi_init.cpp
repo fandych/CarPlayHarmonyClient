@@ -64,7 +64,12 @@ CaptureState *g_state = nullptr;
 std::mutex g_virtualSurfaceMutex;
 VirtualSurfaceState *g_virtualSurface = nullptr;
 constexpr int32_t MAX_ENCODED_BUFFER_BYTES = 4 * 1024 * 1024;
-constexpr uint32_t MAX_QUEUED_VIDEO_BUFFERS = 8;
+constexpr uint32_t MAX_QUEUED_STREAM_BUFFERS = 8;
+
+bool IsStreamBuffer(const CaptureEvent *event)
+{
+    return event != nullptr && (event->kind == "buffer" || event->kind == "audio");
+}
 
 void EmitEvent(CaptureState *state, CaptureEvent *event);
 
@@ -261,7 +266,7 @@ void EmitCaptureError(CaptureState *state, int32_t code)
 void CallJavaScript(napi_env env, napi_value callback, void *, void *data)
 {
     std::unique_ptr<CaptureEvent> event(static_cast<CaptureEvent *>(data));
-    if (event != nullptr && event->kind == "buffer" && event->owner != nullptr) {
+    if (IsStreamBuffer(event.get()) && event->owner != nullptr) {
         event->owner->outstandingBuffers.fetch_sub(1);
     }
     if (env == nullptr || callback == nullptr || event == nullptr) {
@@ -276,7 +281,7 @@ void CallJavaScript(napi_env env, napi_value callback, void *, void *data)
         return;
     }
 
-    if (event->kind == "buffer") {
+    if (IsStreamBuffer(event.get())) {
         void *bufferData = nullptr;
         napi_value arrayBuffer = nullptr;
         if (napi_create_arraybuffer(env, event->data.size(), &bufferData, &arrayBuffer) != napi_ok) {
@@ -338,15 +343,15 @@ void EmitEvent(CaptureState *state, CaptureEvent *event)
     }
     napi_threadsafe_function callback = state->callback;
     if (napi_acquire_threadsafe_function(callback) != napi_ok) {
-        if (event->kind == "buffer") {
+        if (IsStreamBuffer(event)) {
             state->droppedBuffers.fetch_add(1);
         }
         delete event;
         return;
     }
-    if (event->kind == "buffer") {
+    if (IsStreamBuffer(event)) {
         const uint32_t queued = state->outstandingBuffers.fetch_add(1);
-        if (queued >= MAX_QUEUED_VIDEO_BUFFERS) {
+        if (queued >= MAX_QUEUED_STREAM_BUFFERS) {
             state->outstandingBuffers.fetch_sub(1);
             state->droppedBuffers.fetch_add(1);
             delete event;
@@ -372,7 +377,7 @@ void EmitEvent(CaptureState *state, CaptureEvent *event)
         auto *overflow = new (std::nothrow) CaptureEvent();
         if (overflow == nullptr) {
             state->droppedBuffers.fetch_add(dropped);
-            if (event->kind == "buffer") {
+            if (IsStreamBuffer(event)) {
                 state->outstandingBuffers.fetch_sub(1);
                 state->droppedBuffers.fetch_add(1);
             }
@@ -385,7 +390,7 @@ void EmitEvent(CaptureState *state, CaptureEvent *event)
         if (napi_call_threadsafe_function(callback, overflow, napi_tsfn_nonblocking) != napi_ok) {
             state->droppedBuffers.fetch_add(dropped);
             delete overflow;
-            if (event->kind == "buffer") {
+            if (IsStreamBuffer(event)) {
                 state->outstandingBuffers.fetch_sub(1);
                 state->droppedBuffers.fetch_add(1);
             }
@@ -403,7 +408,7 @@ void EmitEvent(CaptureState *state, CaptureEvent *event)
         if (event->kind != "overflow") {
             state->droppedBuffers.fetch_add(1);
         }
-        if (event->kind == "buffer") {
+        if (IsStreamBuffer(event)) {
             state->outstandingBuffers.fetch_sub(1);
         }
         delete event;
@@ -446,7 +451,9 @@ void OnBufferAvailable(OH_AVScreenCapture *, OH_AVBuffer *buffer, OH_AVScreenCap
     int64_t timestamp, void *userData)
 {
     auto *state = static_cast<CaptureState *>(userData);
-    if (state == nullptr || bufferType != OH_SCREEN_CAPTURE_BUFFERTYPE_VIDEO || buffer == nullptr) {
+    const bool isVideo = bufferType == OH_SCREEN_CAPTURE_BUFFERTYPE_VIDEO;
+    const bool isInternalAudio = bufferType == OH_SCREEN_CAPTURE_BUFFERTYPE_AUDIO_INNER;
+    if (state == nullptr || (!isVideo && !isInternalAudio) || buffer == nullptr) {
         return;
     }
     OH_AVCodecBufferAttr attr{};
@@ -467,7 +474,7 @@ void OnBufferAvailable(OH_AVScreenCapture *, OH_AVBuffer *buffer, OH_AVScreenCap
         EmitCaptureError(state, AV_SCREEN_CAPTURE_ERR_NO_MEMORY);
         return;
     }
-    event->kind = "buffer";
+    event->kind = isVideo ? "buffer" : "audio";
     event->flags = attr.flags;
     event->timestamp = timestamp > 0 ? timestamp : attr.pts * 1000;
     try {
@@ -527,27 +534,34 @@ void AbortState(CaptureState *state)
 
 napi_value StartCapture(napi_env env, napi_callback_info info)
 {
-    size_t argc = 4;
-    napi_value args[4] = {nullptr, nullptr, nullptr, nullptr};
-    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc != 4) {
-        return ThrowError(env, "startCapture requires width, height, display ID, and a callback.");
+    size_t argc = 5;
+    napi_value args[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc != 5) {
+        return ThrowError(env, "startCapture requires width, height, display ID, audio sample rate, and a callback.");
     }
     napi_valuetype widthType;
     napi_valuetype heightType;
     napi_valuetype displayIdType;
+    napi_valuetype audioSampleRateType;
     napi_valuetype callbackType;
     int32_t width = 0;
     int32_t height = 0;
     uint32_t displayId = 0;
+    int32_t audioSampleRate = 0;
     if (napi_typeof(env, args[0], &widthType) != napi_ok || widthType != napi_number ||
         napi_typeof(env, args[1], &heightType) != napi_ok || heightType != napi_number ||
         napi_typeof(env, args[2], &displayIdType) != napi_ok || displayIdType != napi_number ||
-        napi_typeof(env, args[3], &callbackType) != napi_ok || callbackType != napi_function ||
+        napi_typeof(env, args[3], &audioSampleRateType) != napi_ok || audioSampleRateType != napi_number ||
+        napi_typeof(env, args[4], &callbackType) != napi_ok || callbackType != napi_function ||
         napi_get_value_int32(env, args[0], &width) != napi_ok ||
         napi_get_value_int32(env, args[1], &height) != napi_ok ||
         napi_get_value_uint32(env, args[2], &displayId) != napi_ok ||
+        napi_get_value_int32(env, args[3], &audioSampleRate) != napi_ok ||
         width < 2 || height < 2 || (width & 1) != 0 || (height & 1) != 0 || width > 4096 || height > 4096) {
         return ThrowError(env, "Capture dimensions must be even integers between 2 and 4096.");
+    }
+    if (audioSampleRate != 0 && audioSampleRate != 44100 && audioSampleRate != 48000) {
+        return ThrowError(env, "Internal AAC capture supports only 44100 Hz or 48000 Hz.");
     }
 
     {
@@ -562,7 +576,7 @@ napi_value StartCapture(napi_env env, napi_callback_info info)
     state->height = height;
     napi_value resourceName = nullptr;
     if (napi_create_string_utf8(env, "CarPlayScreenCapture", NAPI_AUTO_LENGTH, &resourceName) != napi_ok ||
-        napi_create_threadsafe_function(env, args[3], nullptr, resourceName, 0, 1, state,
+        napi_create_threadsafe_function(env, args[4], nullptr, resourceName, 0, 1, state,
             FinalizeCaptureState, nullptr, CallJavaScript, &state->callback) != napi_ok) {
         delete state;
         return ThrowError(env, "Unable to create the screen capture callback.");
@@ -598,8 +612,16 @@ napi_value StartCapture(napi_env env, napi_callback_info info)
     config.videoInfo.videoEncInfo.videoCodec = OH_H264;
     config.videoInfo.videoEncInfo.videoBitrate = 4000000;
     config.videoInfo.videoEncInfo.videoFrameRate = 30;
+    if (audioSampleRate > 0) {
+        config.audioInfo.innerCapInfo.audioSampleRate = audioSampleRate;
+        config.audioInfo.innerCapInfo.audioChannels = 2;
+        config.audioInfo.innerCapInfo.audioSource = OH_ALL_PLAYBACK;
+        config.audioInfo.audioEncInfo.audioCodecformat = OH_AAC_LC;
+        config.audioInfo.audioEncInfo.audioBitrate = 128000;
+    }
 
     if (OH_AVScreenCapture_Init(state->capture, config) != AV_SCREEN_CAPTURE_ERR_OK ||
+        OH_AVScreenCapture_SetMicrophoneEnabled(state->capture, false) != AV_SCREEN_CAPTURE_ERR_OK ||
         OH_AVScreenCapture_SetStateCallback(state->capture, OnStateChange, state) != AV_SCREEN_CAPTURE_ERR_OK ||
         OH_AVScreenCapture_SetErrorCallback(state->capture, OnCaptureError, state) != AV_SCREEN_CAPTURE_ERR_OK ||
         OH_AVScreenCapture_SetDataCallback(state->capture, OnBufferAvailable, state) != AV_SCREEN_CAPTURE_ERR_OK) {

@@ -11,7 +11,7 @@ import airPlayControlCipherTest from './AirPlayControlCipher.test';
 import airPlayMediaSetupProtocolTest from './AirPlayMediaSetupProtocol.test';
 import harmonyAirPlayTimingServerTest from './HarmonyAirPlayTimingServer.test';
 import carPlayDiagnosticsTest from './CarPlayDiagnostics.test';
-import harmonySppClientTest from './HarmonySppClient.test';
+import harmonySppServerTest from './HarmonySppServer.test';
 import harmonyWifiSelectionTest from './HarmonyWifiSelection.test';
 import harmonyBluetoothIdentityTest from './HarmonyBluetoothIdentity.test';
 import carPlaySettingsTest from './CarPlaySettings.test';
@@ -31,7 +31,7 @@ export default function testsuite() {
   airPlayMediaSetupProtocolTest();
   harmonyAirPlayTimingServerTest();
   carPlayDiagnosticsTest();
-  harmonySppClientTest();
+  harmonySppServerTest();
   harmonyWifiSelectionTest();
   harmonyBluetoothIdentityTest();
   carPlaySettingsTest();

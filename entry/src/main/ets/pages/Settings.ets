@@ -2,7 +2,7 @@ import { PageHeader, showPageError } from '../components/PageHeader';
 import { CarPlaySettings } from '../app/settings/CarPlaySettings';
 import { carPlaySettings } from '../platform/settings/HarmonySettings';
 import { carPlaySessionController, isCarPlaySessionActive } from '../app/session/CarPlaySessionController';
-import { PairedAccessory } from '../platform/bluetooth/HarmonySppClient';
+import { PairedAccessory } from '../platform/bluetooth/HarmonySppServer';
 
 @Entry
 @Component
@@ -202,7 +202,7 @@ struct Settings {
             .enabled(this.editable()).maxLength(64)
             .onChange((value: string) => { this.deviceName = value; })
 
-          this.section('目标接收端', '先在系统设置配对，刷新后选择车机或 DiPlay，并保存设置。不会自动连接其他已配对设备。')
+          this.section('已配对设备（可选）', '手机启动安全 RFCOMM 监听并等待车机主动连接；此处选择不作为连接目标或访问限制。')
           Button('刷新已配对设备').enabled(this.editable()).onClick(() => this.refreshDevices())
           Select(this.targetOptions)
             .selected(this.targetIndex)
