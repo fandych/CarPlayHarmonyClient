@@ -36,7 +36,7 @@
 - 当前模块目标类型为 `phone`。本轮不依赖独立虚拟屏；已移除无用途且影响普通安装的 `ACCESS_VIRTUAL_SCREEN` 请求和创建探测。未声明 `CONTROL_DEVICE`。本轮 default HAP 已成功覆盖安装并启动；设备重连后的实际身份检测日志明确报告 `GET_BLUETOOTH_LOCAL_MAC` 未授予，未取得真实地址。HDC 系统参数返回 `OpenHarmony-7.0.0.105`，不将历史系统版本记录当作本轮结果。
 - 真机蓝牙探测已运行：系统报告 9 个已配对设备，但均未建立 iAP2 RFCOMM 连接；当前未连接 CarPlay 车机，因此 iAP2 后续交换、Wi-Fi 入网、mDNS 和 RTSP 均未实测。
 - 本机真实蓝牙地址对应系统接口 `access.getLocalAddress()`，不是 Socket 的远端 `getDeviceId()`。公开 SDK 不包含该系统方法的 ArkTS 声明；实现使用有类型声明的小型 JS 兼容边界检测方法是否存在，调用前仍严格核验两项权限，完全保留系统应用身份与权限检查。当前签名不足以自动读取；用户后续明确允许填写本机真实地址作为备用，不再因缺少系统权限而无条件阻断该配置路径。
-- AirPlay 屏幕流 `SETUP/RECORD`、视频 TCP 数据口、`DataStream` 输出密钥、事件通道及用户授权的 `OH_AVScreenCapture` 编码采集现已接入控制器生命周期，并区分等待首帧与实际投屏。PLR-AL00 上 Hypium 测试实际运行 3 项并全部通过（Ability 基础测试及设置/Asset 持久化）；这些测试没有覆盖采集授权、编码输出、CarPlay 接收端或画面解码。当前尚未连接车机，故 iAP2、Wi-Fi 入网、mDNS、配对、授权弹窗、首帧发送和真实投屏均未验收；phone 目标也没有虚拟屏画面源或触摸回控。协议协商和测试 HAP 通过不等于真机投屏，不得将当前阶段描述为完整 CarPlay 支持。
+- AirPlay 屏幕流 `SETUP/RECORD`、视频 TCP 数据口、`DataStream` 输出密钥、事件通道及用户授权的 `OH_AVScreenCapture` 编码采集现已接入控制器生命周期，并区分等待首帧与实际投屏。本轮最新 default HAP 已在 PLR-AL00 安装并启动，`EntryAbility` 到达前台；Hypium 真机测试实际运行 3 项并全部通过（Ability 基础测试及设置/Asset 持久化），但这些测试没有覆盖采集授权、编码输出、CarPlay 接收端或画面解码。当前尚未连接车机，故 iAP2、Wi-Fi 入网、mDNS、配对、授权弹窗、首帧发送和真实投屏均未验收；phone 目标也没有虚拟屏画面源或触摸回控。协议协商和测试 HAP 通过不等于真机投屏，不得将当前阶段描述为完整 CarPlay 支持。
 
 ## 本机蓝牙身份：接口、权限与使用
 
