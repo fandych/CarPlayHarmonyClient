@@ -217,34 +217,27 @@ struct Index {
               .enabled(this.ready && !this.busy && !this.changingSwitch)
               .onChange((value: boolean) => { void this.changeEnabled(value); })
           }
-          if (this.carPlayEnabled && !isCarPlaySessionActive(this.state)) {
-            Button('重试连接')
-              .enabled(this.ready && !this.busy)
-              .onClick(() => {
-                void carPlaySessionController.start().catch((error: Error) => {
-                  showPageError(this.getUIContext(), '重试连接', error);
-                });
-              })
-          }
           Divider().color($r('app.color.divider'))
           Row({ space: 12 }) {
-            Text('设备')
-              .fontSize(18)
-              .fontColor($r('app.color.primary_text'))
-            Text(this.selectedDeviceName.length > 0 ? this.selectedDeviceName : '选择接收端')
-              .fontSize(15)
-              .fontColor($r('app.color.secondary_text'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
+            Row({ space: 12 }) {
+              Text('设备')
+                .fontSize(18)
+                .fontColor($r('app.color.primary_text'))
+              Text(this.selectedDeviceName.length > 0 ? this.selectedDeviceName : '选择接收端')
+                .fontSize(15)
+                .fontColor($r('app.color.secondary_text'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+            }
+            .layoutWeight(1)
+            .height('100%')
+            .accessibilityText('设备，点击选择接收端')
+            .onClick(() => this.openDevicePicker())
             Button(this.selectedDeviceId.length === 0 ? '选择' :
               isCarPlaySessionActive(this.state) ? '已连接' : '连接')
               .enabled(this.ready && !this.busy && !isCarPlaySessionActive(this.state))
               .onClick(() => this.connectOrChooseDevice())
-            Text('>')
-              .fontSize(20)
-              .fontColor($r('app.color.secondary_text'))
-              .onClick(() => this.openDevicePicker())
           }
           .width('100%')
           .height(48)
