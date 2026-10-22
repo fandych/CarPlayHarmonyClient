@@ -17,6 +17,7 @@ export interface WifiSecretVault {
 interface SettingsRecord {
   settings: CarPlaySettings;
   secretAlias: string;
+  trustedMfiFingerprints?: string[];
 }
 
 export interface CarPlaySettingsSnapshot {
@@ -25,12 +26,14 @@ export interface CarPlaySettingsSnapshot {
   error: string;
   settings: CarPlaySettings;
   hasWifiPassword: boolean;
+  trustedMfiFingerprints: string[];
 }
 
 export class CarPlaySettingsStore {
   private configuration: CarPlaySettings = defaultCarPlaySettings();
   private secret: string = '';
   private alias: string = '';
+  private trustedMfiFingerprints: string[] = [];
   private ready: boolean = false;
   private busy: boolean = false;
   private error: string = '';
@@ -54,7 +57,8 @@ export class CarPlaySettingsStore {
 
   snapshot(): CarPlaySettingsSnapshot {
     return { ready: this.ready, busy: this.busy, error: this.error,
-      settings: validateCarPlaySettings(this.configuration), hasWifiPassword: this.secret.length > 0 };
+      settings: validateCarPlaySettings(this.configuration), hasWifiPassword: this.secret.length > 0,
+      trustedMfiFingerprints: this.trustedMfiFingerprints.slice() };
   }
 
   password(): string {
@@ -72,13 +76,26 @@ export class CarPlaySettingsStore {
       let next = defaultCarPlaySettings();
       let alias = '';
       let password = '';
+      let pins: string[] = [];
       if (raw.length > 0) {
         if (raw.length > 32768) {
           throw new Error('本地配置记录过大。');
         }
         const record: SettingsRecord = JSON.parse(raw);
-        requireSettingsKeys(record, ['settings', 'secretAlias'], '本地配置记录');
+        const recordKeys = Object.keys(record);
+        if (recordKeys.length === 2 && recordKeys.includes('settings') && recordKeys.includes('secretAlias')) {
+          record.trustedMfiFingerprints = [];
+        } else {
+          requireSettingsKeys(record, ['settings', 'secretAlias', 'trustedMfiFingerprints'], '本地配置记录');
+        }
         next = validateCarPlaySettings(record.settings);
+        const trustedPins = record.trustedMfiFingerprints;
+        if (!Array.isArray(trustedPins) || trustedPins.length > 64 ||
+          trustedPins.some((fingerprint: string) => typeof fingerprint !== 'string' ||
+            !/^[0-9a-f]{64}$/.test(fingerprint))) {
+          throw new Error('本机 MFi 信任指纹记录不合法。');
+        }
+        pins = trustedPins.slice();
         if (typeof record.secretAlias !== 'string' ||
           (record.secretAlias.length > 0 && !/^CarPlayHarmony\.Wifi\.v1\.[0-9a-f-]{36}$/.test(record.secretAlias))) {
           throw new Error('本地密码引用不合法。');
@@ -92,6 +109,7 @@ export class CarPlaySettingsStore {
       this.configuration = next;
       this.alias = alias;
       this.secret = password;
+      this.trustedMfiFingerprints = pins;
       this.ready = true;
     } catch (error) {
       this.fail('载入配置', error);
@@ -116,7 +134,11 @@ export class CarPlaySettingsStore {
         next.wifi.securityType === this.configuration.wifi.securityType && password === this.secret;
       newAlias = unchanged ? oldAlias : password.length === 0 ? '' :
         await this.vault.add(next.wifi.ssid, next.wifi.securityType, password);
-      const record: SettingsRecord = { settings: next, secretAlias: newAlias };
+      const record: SettingsRecord = {
+        settings: next,
+        secretAlias: newAlias,
+        trustedMfiFingerprints: this.trustedMfiFingerprints.slice()
+      };
       this.persistence.write(JSON.stringify(record));
       this.configuration = next;
       this.secret = password;
@@ -151,13 +173,71 @@ export class CarPlaySettingsStore {
     return serializeCarPlaySettings(this.configuration);
   }
 
+  async addTrustedMfiFingerprint(fingerprint: string): Promise<void> {
+    if (!/^[0-9a-f]{64}$/.test(fingerprint)) {
+      throw new Error('MFi SHA-256 指纹格式无效。');
+    }
+    if (!this.ready) {
+      throw new Error('配置尚未就绪，不能保存 MFi 信任。');
+    }
+    if (this.trustedMfiFingerprints.includes(fingerprint)) {
+      return;
+    }
+    if (this.trustedMfiFingerprints.length >= 64) {
+      throw new Error('本机 MFi 信任指纹已达到 64 条上限，请先撤销不再使用的信任。');
+    }
+    this.begin();
+    const next = this.trustedMfiFingerprints.concat([fingerprint]);
+    try {
+      this.persistence.write(JSON.stringify({
+        settings: this.configuration,
+        secretAlias: this.alias,
+        trustedMfiFingerprints: next
+      }));
+      this.trustedMfiFingerprints = next;
+    } catch (error) {
+      this.fail('保存 MFi 信任指纹', error);
+      throw error instanceof Error ? error : new Error('保存 MFi 信任指纹失败。');
+    } finally {
+      this.end();
+    }
+  }
+
+  async removeTrustedMfiFingerprint(fingerprint: string): Promise<void> {
+    if (!this.ready) {
+      throw new Error('配置尚未就绪，不能修改 MFi 信任。');
+    }
+    if (!this.trustedMfiFingerprints.includes(fingerprint)) {
+      return;
+    }
+    this.begin();
+    const next = this.trustedMfiFingerprints.filter((item: string) => item !== fingerprint);
+    try {
+      this.persistence.write(JSON.stringify({
+        settings: this.configuration,
+        secretAlias: this.alias,
+        trustedMfiFingerprints: next
+      }));
+      this.trustedMfiFingerprints = next;
+    } catch (error) {
+      this.fail('撤销 MFi 信任指纹', error);
+      throw error instanceof Error ? error : new Error('撤销 MFi 信任指纹失败。');
+    } finally {
+      this.end();
+    }
+  }
+
   async importJson(json: string): Promise<void> {
     const next = parseCarPlaySettings(json);
     next.enabled = false;
     if (!this.ready) {
       this.begin();
       try {
-        const record: SettingsRecord = { settings: next, secretAlias: '' };
+        const record: SettingsRecord = {
+          settings: next,
+          secretAlias: '',
+          trustedMfiFingerprints: this.trustedMfiFingerprints.slice()
+        };
         this.persistence.write(JSON.stringify(record));
         this.configuration = next;
         this.secret = '';

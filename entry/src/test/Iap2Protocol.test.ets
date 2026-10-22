@@ -5,6 +5,10 @@ import { Iap2LinkEngine } from '../main/ets/protocol/iap2/Iap2LinkEngine';
 import { BinaryPlist } from '../main/ets/protocol/airplay/BinaryPlist';
 import { RtspResponseParser } from '../main/ets/protocol/airplay/RtspResponseParser';
 import { Iap2SenderSession, parseCarPlayStartSession } from '../main/ets/protocol/iap2/Iap2SenderSession';
+import { classifyMfiPkixTrustFailure } from '../main/ets/protocol/iap2/MfiVerifier';
+import {
+  DeterministicMfiVerifier, authenticateTestAccessory, csmMessages, deterministicTestRandomBytes
+} from './Iap2MfiTestSupport';
 
 function assertBytes(actual: Uint8Array, expected: number[]): void {
   expect(actual.length).assertEqual(expected.length);
@@ -34,10 +38,7 @@ function joinBytes(parts: Uint8Array[]): Uint8Array {
 }
 
 function containsMessageId(messages: Uint8Array[], messageId: number): boolean {
-  return messages.some((message: Uint8Array) => {
-    const frames = new Iap2CsmParser().offer(message);
-    return frames.length === 1 && frames[0].messageId === messageId;
-  });
+  return csmMessages(messages).some((frame) => frame.messageId === messageId);
 }
 
 export default function iap2ProtocolTest(): void {
@@ -231,13 +232,23 @@ export default function iap2ProtocolTest(): void {
       expect(endpoint.ipAddresses[0]).assertEqual('192.168.49.1');
     });
 
-    it('uses accessory capability lists and acknowledges StartHID', 0, () => {
+    it('uses accessory capability lists only after verifying the MFi challenge', 0, async () => {
       const sent: Uint8Array[] = [];
       const logs: string[] = [];
+      const failures: string[] = [];
       const session = new Iap2SenderSession(
         (bytes: Uint8Array) => sent.push(bytes),
         (message: string) => logs.push(message),
-        () => {}
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new DeterministicMfiVerifier(),
+        (reason: string) => failures.push(reason),
+        undefined,
+        deterministicTestRandomBytes
       );
       session.start();
       sent.length = 0;
@@ -250,14 +261,19 @@ export default function iap2ProtocolTest(): void {
         Iap2Csm.param(7, new Uint8Array([0x43, 0x00]))
       ]);
       session.receive(Iap2Csm.encode(0x1D01, identification));
-      session.receive(Iap2Csm.encode(0xAA03));
+      await session.whenIdle();
+      await authenticateTestAccessory(session, sent);
 
+      expect(failures[0] ?? '').assertEqual('');
+      expect(failures.length).assertEqual(0);
+      expect(logs.some((message: string) => message.indexOf('已发送 MFi 认证成功标记') >= 0)).assertTrue();
       expect(containsMessageId(sent, 0xAA05)).assertTrue();
       expect(containsMessageId(sent, 0x5702)).assertFalse();
       expect(logs.some((message: string) => message.indexOf('不支持旧版 Wi-Fi 配置交换') >= 0)).assertTrue();
 
       sent.length = 0;
       session.receive(Iap2Csm.encode(0x6800));
+      await session.whenIdle();
       expect(containsMessageId(sent, 0x6801)).assertTrue();
       const response = new Iap2CsmParser().offer(sent[0])[0];
       const parameters = Iap2Csm.parseParams(response.body);
@@ -266,36 +282,154 @@ export default function iap2ProtocolTest(): void {
       session.close();
     });
 
-    it('requests legacy Wi-Fi configuration when the accessory advertises support', 0, () => {
+    it('requests legacy Wi-Fi configuration after verified MFi authentication', 0, async () => {
       const sent: Uint8Array[] = [];
       const session = new Iap2SenderSession(
         (bytes: Uint8Array) => sent.push(bytes),
         () => {},
-        () => {}
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new DeterministicMfiVerifier(),
+        undefined,
+        undefined,
+        deterministicTestRandomBytes
       );
       const identification = joinBytes([
         Iap2Csm.param(6, new Uint8Array([0x57, 0x03])),
         Iap2Csm.param(7, new Uint8Array([0x57, 0x02]))
       ]);
       session.receive(Iap2Csm.encode(0x1D01, identification));
-      session.receive(Iap2Csm.encode(0xAA03));
+      await session.whenIdle();
+      await authenticateTestAccessory(session, sent);
       expect(containsMessageId(sent, 0x5702)).assertTrue();
       session.close();
     });
 
-    it('treats malformed accessory capability lists as unknown', 0, () => {
+    it('treats malformed accessory capability lists as unknown after MFi verification', 0, async () => {
       const sent: Uint8Array[] = [];
       const logs: string[] = [];
       const session = new Iap2SenderSession(
         (bytes: Uint8Array) => sent.push(bytes),
         (message: string) => logs.push(message),
-        () => {}
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new DeterministicMfiVerifier(),
+        undefined,
+        undefined,
+        deterministicTestRandomBytes
       );
       session.receive(Iap2Csm.encode(0x1D01, Iap2Csm.param(7, new Uint8Array([0x57]))));
-      session.receive(Iap2Csm.encode(0xAA03));
+      await session.whenIdle();
+      await authenticateTestAccessory(session, sent);
       expect(containsMessageId(sent, 0x5702)).assertTrue();
       expect(logs.some((message: string) => message.indexOf('格式无效') >= 0)).assertTrue();
       session.close();
+    });
+
+    it('never authenticates an empty unsolicited MFi response', 0, async () => {
+      const sent: Uint8Array[] = [];
+      const failures: string[] = [];
+      const session = new Iap2SenderSession(
+        (bytes: Uint8Array) => sent.push(bytes),
+        () => {},
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new DeterministicMfiVerifier(),
+        (reason: string) => failures.push(reason),
+        undefined,
+        deterministicTestRandomBytes
+      );
+      session.receive(Iap2Csm.encode(0xAA03));
+      await session.whenIdle();
+      expect(containsMessageId(sent, 0xAA05)).assertFalse();
+      expect(containsMessageId(sent, 0x5702)).assertFalse();
+      expect(failures.length).assertEqual(1);
+      session.close();
+    });
+
+    it('rejects invalid MFi challenge signatures without requesting Wi-Fi', 0, async () => {
+      const sent: Uint8Array[] = [];
+      const failures: string[] = [];
+      const session = new Iap2SenderSession(
+        (bytes: Uint8Array) => sent.push(bytes),
+        () => {},
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new DeterministicMfiVerifier(),
+        (reason: string) => failures.push(reason),
+        undefined,
+        deterministicTestRandomBytes
+      );
+      session.receive(Iap2Csm.encode(0x1D01));
+      await session.whenIdle();
+      session.receive(Iap2Csm.encode(0xAA01, Iap2Csm.param(0, new Uint8Array([1, 2, 3]))));
+      await session.whenIdle();
+      session.receive(Iap2Csm.encode(0xAA03, Iap2Csm.param(0, new Uint8Array([0]))));
+      await session.whenIdle();
+      expect(containsMessageId(sent, 0xAA05)).assertFalse();
+      expect(containsMessageId(sent, 0x5702)).assertFalse();
+      expect(failures.length).assertEqual(1);
+      session.close();
+    });
+
+    it('stops after all supported MFi challenge sizes are rejected', 0, async () => {
+      const sent: Uint8Array[] = [];
+      const failures: string[] = [];
+      const session = new Iap2SenderSession(
+        (bytes: Uint8Array) => sent.push(bytes),
+        () => {},
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new DeterministicMfiVerifier(),
+        (reason: string) => failures.push(reason),
+        undefined,
+        deterministicTestRandomBytes
+      );
+      session.receive(Iap2Csm.encode(0x1D01));
+      await session.whenIdle();
+      session.receive(Iap2Csm.encode(0xAA01, Iap2Csm.param(0, new Uint8Array([1, 2, 3]))));
+      await session.whenIdle();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        session.receive(Iap2Csm.encode(0xAA04));
+        await session.whenIdle();
+      }
+      expect(csmMessages(sent).filter((frame) => frame.messageId === 0xAA02).length).assertEqual(3);
+      expect(containsMessageId(sent, 0xAA05)).assertFalse();
+      expect(containsMessageId(sent, 0x5702)).assertFalse();
+      expect(failures.length).assertEqual(1);
+      session.close();
+    });
+
+    it('prompts only for eligible issuer trust failures', 0, () => {
+      const fingerprint = 'a'.repeat(64);
+      expect(classifyMfiPkixTrustFailure('unable to get local issuer certificate', fingerprint, []))
+        .assertEqual('prompt-for-pin');
+      expect(classifyMfiPkixTrustFailure('certificate has expired', fingerprint, []))
+        .assertEqual('reject');
+      expect(classifyMfiPkixTrustFailure('key cannot be used for a digital signature', fingerprint, []))
+        .assertEqual('reject');
+      expect(classifyMfiPkixTrustFailure('untrusted certificate', fingerprint, [fingerprint]))
+        .assertEqual('already-pinned');
     });
   });
 }

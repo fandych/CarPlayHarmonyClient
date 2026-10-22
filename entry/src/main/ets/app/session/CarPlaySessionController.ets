@@ -16,6 +16,7 @@ import {
   CarPlayStartSessionEndpoint,
   Iap2SenderSession
 } from '../../protocol/iap2/Iap2SenderSession';
+import { MfiTrustPromptInfo, MfiVerifier } from '../../protocol/iap2/MfiVerifier';
 import { HarmonyWifiClient } from '../../platform/network/HarmonyWifiClient';
 import { AirPlayServiceEndpoint, HarmonyMdnsBrowser } from '../../platform/network/HarmonyMdnsBrowser';
 import { HarmonyAirPlayClient } from '../../platform/network/HarmonyAirPlayClient';
@@ -27,7 +28,7 @@ import { CarPlayInviteRequest } from '../../protocol/airplay/CarPlayInviteProtoc
 
 export type CarPlaySessionState =
   'idle' | 'connecting' | 'bluetooth-connected' | 'iap2-negotiating' | 'iap2-ready' |
-  'wifi-pending' | 'wifi-connected' | 'airplay-found' | 'media-negotiating' |
+  'mfi-authenticating' | 'wifi-pending' | 'wifi-connected' | 'airplay-found' | 'media-negotiating' |
   'waiting-video' | 'screen-capture-pending' | 'streaming' | 'blocked' | 'error';
 
 export function isCarPlaySessionActive(state: CarPlaySessionState): boolean {
@@ -45,6 +46,7 @@ export interface CarPlaySessionSnapshot {
   connectedDeviceName: string;
   identitySource: BluetoothIdentitySource;
   systemBluetoothAddress: string;
+  mfiTrustRequest: MfiTrustPromptInfo | undefined;
 }
 
 type SessionListener = (snapshot: CarPlaySessionSnapshot) => void;
@@ -85,6 +87,9 @@ class CarPlaySessionController {
   private wifiConnectionStarted: boolean = false;
   private receivedCarPlayInvite: boolean = false;
   private pairingStarted: boolean = false;
+  private mfiTrustRequest: MfiTrustPromptInfo | undefined = undefined;
+  private mfiTrustResolver: ((approved: boolean) => void) | undefined = undefined;
+  private mfiTrustTimer: number | undefined = undefined;
   constructor() {
     carPlayDiagnostics.subscribe((line: string) => {
       this.logs.push(line);
@@ -174,7 +179,8 @@ class CarPlaySessionController {
       blockedReason: this.blockedReason,
       connectedDeviceName: this.connectedDeviceName,
       identitySource: this.identitySource,
-      systemBluetoothAddress: this.systemBluetoothAddress
+      systemBluetoothAddress: this.systemBluetoothAddress,
+      mfiTrustRequest: this.mfiTrustRequest
     };
   }
 
@@ -343,13 +349,22 @@ class CarPlaySessionController {
       this.connectedDeviceName = target.name;
       this.setState('bluetooth-connected');
       this.identificationStarted = false;
+      let writeQueue: Promise<void> = Promise.resolve();
+      let writeFailed = false;
       const link = new Iap2LinkEngine((bytes: Uint8Array) => {
-        connection.write(bytes).then(() => {
-        }, (error: Error) => {
+        const copy = bytes.slice();
+        const operation = writeQueue.then(async (): Promise<void> => {
+          if (!this.isCurrent(generation) || writeFailed) {
+            return;
+          }
+          await connection.write(copy);
+        }).catch((error: Error) => {
+          writeFailed = true;
           if (this.isCurrent(generation)) {
             this.failSession(`iAP2 RFCOMM 写入失败：${describeFailure(error)}`);
           }
         });
+        writeQueue = operation;
       });
       this.linkEngine = link;
       link.onStateChanged = (state: Iap2LinkState) => this.onLinkState(state, generation);
@@ -440,6 +455,7 @@ class CarPlaySessionController {
 
   stop(): void {
     this.generation++;
+    this.resolveMfiTrust(false);
     this.sppClient.stop();
     this.identityProvider = undefined;
     this.realBluetoothAddress = undefined;
@@ -558,7 +574,25 @@ class CarPlaySessionController {
         (reason: string) => this.blockSession(reason),
         this.realBluetoothAddress,
         carPlaySettings.snapshot().settings.deviceName,
-        () => this.armWifiFallback(generation)
+        () => this.armWifiFallback(generation),
+        new MfiVerifier(
+          (message: string) => this.appendLog(message),
+          false,
+          carPlaySettings.trustedMfiFingerprints(),
+          (info: MfiTrustPromptInfo) => this.requestMfiTrust(info, generation),
+          (fingerprint: string) => carPlaySettings.addTrustedMfiFingerprint(fingerprint)
+        ),
+        (reason: string) => {
+          if (this.isCurrent(generation)) {
+            this.failSession(`MFi 认证失败：${describeFailure(new Error(reason))}`);
+          }
+        },
+        (stage: 'authenticating' | 'authenticated') => {
+          if (!this.isCurrent(generation)) {
+            return;
+          }
+          this.setState(stage === 'authenticating' ? 'mfi-authenticating' : 'iap2-ready');
+        }
       );
       this.senderSession.start();
     } else if (state === 'negotiating') {
@@ -575,6 +609,44 @@ class CarPlaySessionController {
       } catch (error) {
         this.failSession(`iAP2 控制消息处理失败：${describeFailure(error)}`);
       }
+    }
+  }
+
+  approveMfiTrust(fingerprint: string, approved: boolean): void {
+    if (this.mfiTrustRequest?.fingerprint !== fingerprint) {
+      return;
+    }
+    this.resolveMfiTrust(approved);
+  }
+
+  private requestMfiTrust(info: MfiTrustPromptInfo, generation: number): Promise<boolean> {
+    if (!this.isCurrent(generation) || this.mfiTrustResolver !== undefined) {
+      return Promise.resolve(false);
+    }
+    this.mfiTrustRequest = info;
+    this.appendLog(`MFi 证书需要用户确认信任，SHA-256=${info.fingerprint}。`);
+    this.notify();
+    return new Promise<boolean>((resolve) => {
+      this.mfiTrustResolver = resolve;
+      this.mfiTrustTimer = setTimeout(() => {
+        this.mfiTrustTimer = undefined;
+        this.appendLog('等待用户确认 MFi 证书超时；认证已拒绝。', true);
+        this.resolveMfiTrust(false);
+      }, 60000);
+    });
+  }
+
+  private resolveMfiTrust(approved: boolean): void {
+    const resolve = this.mfiTrustResolver;
+    this.mfiTrustResolver = undefined;
+    if (this.mfiTrustTimer !== undefined) {
+      clearTimeout(this.mfiTrustTimer);
+      this.mfiTrustTimer = undefined;
+    }
+    this.mfiTrustRequest = undefined;
+    if (resolve !== undefined) {
+      resolve(approved);
+      this.notify();
     }
   }
 

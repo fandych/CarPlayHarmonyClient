@@ -1,6 +1,7 @@
 import cryptoFramework from '@ohos.security.cryptoFramework';
 import { Iap2Csm, Iap2CsmFrame, Iap2Param, Iap2CsmParser } from './Iap2Csm';
 import { CarPlayInviteProtocol } from '../airplay/CarPlayInviteProtocol';
+import { MfiVerifier, ValidatedMfiCertificate } from './MfiVerifier';
 
 export interface AccessoryWifiConfiguration {
   ssid: string;
@@ -25,6 +26,8 @@ type SessionLogger = (message: string) => void;
 type SendControl = (bytes: Uint8Array) => void;
 type WifiConfigurationListener = (configuration: AccessoryWifiConfiguration) => void;
 type EndpointListener = (endpoint: CarPlayStartSessionEndpoint) => void;
+type MfiStageListener = (stage: 'authenticating' | 'authenticated') => void;
+type SecureRandomBytes = (length: number) => Promise<Uint8Array>;
 
 function concatenateParameters(parameters: Uint8Array[]): Uint8Array {
   let length = 0;
@@ -55,11 +58,17 @@ export class Iap2SenderSession {
   private readonly parser: Iap2CsmParser = new Iap2CsmParser();
   private active: boolean = true;
   private authenticationSent: boolean = false;
+  private authenticated: boolean = false;
   private challengeStarted: boolean = false;
+  private mfiFailed: boolean = false;
+  private identificationReceived: boolean = false;
   private challengeTimer: number = -1;
   private challengeLengths: number[] = [];
   private challengeAttemptIndex: number = 0;
   private prefer20ByteChallenge: boolean = true;
+  private validatedAccessoryCertificate: ValidatedMfiCertificate | undefined = undefined;
+  private pendingMfiChallenge: Uint8Array | undefined = undefined;
+  private receiveQueue: Promise<void> = Promise.resolve();
   private readonly sendControl: SendControl;
   private readonly log: SessionLogger;
   private readonly onWifiConfiguration: WifiConfigurationListener;
@@ -68,6 +77,10 @@ export class Iap2SenderSession {
   private readonly realBluetoothAddress: string | undefined;
   private readonly deviceName: string;
   private readonly onWifiPending: (() => void) | undefined;
+  private readonly mfiVerifier: MfiVerifier;
+  private readonly onFailure: (reason: string) => void;
+  private readonly onMfiStage: MfiStageListener;
+  private readonly secureRandomBytes: SecureRandomBytes;
   private availabilitySent: boolean = false;
   private accessorySendMessageIds: Set<number> | undefined = undefined;
   private accessoryReceiveMessageIds: Set<number> | undefined = undefined;
@@ -80,7 +93,11 @@ export class Iap2SenderSession {
     onBlocked?: (reason: string) => void,
     realBluetoothAddress?: string,
     deviceName: string = 'Harmony CarPlay',
-    onWifiPending?: () => void
+    onWifiPending?: () => void,
+    mfiVerifier?: MfiVerifier,
+    onFailure: (reason: string) => void = () => {},
+    onMfiStage: MfiStageListener = () => {},
+    secureRandomBytes?: SecureRandomBytes
   ) {
     this.sendControl = sendControl;
     this.log = log;
@@ -94,6 +111,11 @@ export class Iap2SenderSession {
     }
     this.deviceName = deviceName;
     this.onWifiPending = onWifiPending;
+    this.mfiVerifier = mfiVerifier ?? new MfiVerifier(log);
+    this.onFailure = onFailure;
+    this.onMfiStage = onMfiStage;
+    this.secureRandomBytes = secureRandomBytes ?? (async (length: number): Promise<Uint8Array> =>
+      (await cryptoFramework.createRandom().generateRandom(length)).data);
   }
 
   start(): void {
@@ -110,48 +132,69 @@ export class Iap2SenderSession {
       if (!this.active) {
         break;
       }
-      this.handleFrame(frames[index]);
+      const frame = frames[index];
+      this.receiveQueue = this.receiveQueue.then(async (): Promise<void> => {
+        if (this.active) {
+          await this.handleFrame(frame);
+        }
+      }).catch((error: Error) => {
+        this.failAuthentication(error instanceof Error ? error.message : String(error));
+      });
     }
   }
 
   close(): void {
     this.active = false;
-    if (this.challengeTimer >= 0) {
-      clearTimeout(this.challengeTimer);
-      this.challengeTimer = -1;
-    }
+    this.clearChallengeTimer();
+    this.clearPendingChallenge();
   }
 
-  private handleFrame(frame: Iap2CsmFrame): void {
+  async whenIdle(): Promise<void> {
+    await this.receiveQueue;
+  }
+
+  private async handleFrame(frame: Iap2CsmFrame): Promise<void> {
     this.log(`iAP2 rx type=0x${frame.messageId.toString(16).padStart(4, '0')}; bodyBytes=${frame.body.length}。`);
     switch (frame.messageId) {
       case 0x1D01:
-        this.handleIdentification(frame);
+        await this.handleIdentification(frame);
         break;
       case MFI_CERTIFICATE:
-        this.beginMfiChallenge(frame);
+        await this.beginMfiChallenge(frame);
         break;
       case MFI_RESPONSE:
-        this.completeAuthentication(`收到 MFi 挑战响应（${frame.body.length} 字节）；兼容流程跳过签名校验。`);
+        await this.completeMfiAuthentication(frame);
         break;
       case MFI_AUTHENTICATION_FAILED:
-        this.retryMfiChallenge('车机拒绝了当前长度的 MFi 挑战。');
+        await this.retryMfiChallenge('车机拒绝了当前长度的 MFi challenge。');
         break;
       case ACCESSORY_WIFI_CONFIGURATION:
-        this.handleWifiConfiguration(frame);
+        if (this.authenticated) {
+          this.handleWifiConfiguration(frame);
+        } else {
+          this.log('认证完成前收到 Wi-Fi 配置；已忽略。');
+        }
         break;
       case CARPLAY_START_SESSION:
-        this.handleStartSession(frame);
+        if (this.authenticated) {
+          this.handleStartSession(frame);
+        } else {
+          this.log('认证完成前收到 CarPlayStartSession；已忽略。');
+        }
         break;
       case START_HID:
-        this.sendMessage(
-          DEVICE_HID_REPORT,
-          concatenateParameters([
-            Iap2Csm.u16(0, 0),
-            Iap2Csm.param(1, new Uint8Array([0]))
-          ])
-        );
-        this.log('已响应车机 StartHID 请求。');
+        if (this.authenticated) {
+          this.sendMessage(
+            DEVICE_HID_REPORT,
+            concatenateParameters([
+              Iap2Csm.u16(0, 0),
+              Iap2Csm.param(1, new Uint8Array([0]))
+            ])
+          );
+          this.log('已响应车机 StartHID 请求。');
+        } else {
+          this.log('认证完成前收到 StartHID；已忽略。');
+        }
         break;
       default:
         this.log(`收到 iAP2 消息 0x${frame.messageId.toString(16).padStart(4, '0')}。`);
@@ -159,7 +202,12 @@ export class Iap2SenderSession {
     }
   }
 
-  private handleIdentification(frame: Iap2CsmFrame): void {
+  private async handleIdentification(frame: Iap2CsmFrame): Promise<void> {
+    if (this.identificationReceived || this.authenticationSent || this.mfiFailed) {
+      this.log('忽略重复或过期的 iAP2 设备身份消息。');
+      return;
+    }
+    this.identificationReceived = true;
     const params = Iap2Csm.parseParams(frame.body);
     const name = this.stringParam(params, 0);
     const model = this.stringParam(params, 1);
@@ -173,79 +221,108 @@ export class Iap2SenderSession {
       `hasManufacturer=${manufacturer.length > 0}; prefer20ByteChallenge=${this.prefer20ByteChallenge}。`);
     this.sendMessage(0x1D02);
     this.sendMessage(MFI_REQUEST_CERTIFICATE);
-    this.log('已接受车机身份并请求 MFi 证书。');
+    this.onMfiStage('authenticating');
+    this.log('已回送 IDENTIFICATION_ACCEPTED，并请求 MFi 证书；等待 AA01。');
   }
 
-  private beginMfiChallenge(frame: Iap2CsmFrame): void {
-    if (this.challengeStarted || this.authenticationSent) {
+  private async beginMfiChallenge(frame: Iap2CsmFrame): Promise<void> {
+    if (!this.identificationReceived || this.challengeStarted || this.authenticationSent || this.mfiFailed) {
+      this.log('忽略握手阶段不匹配或重复的 MFi 证书消息。');
       return;
     }
     this.challengeStarted = true;
-    this.log(`已收到 MFi 证书（${frame.body.length} 字节）；正在生成一次性挑战。`);
+    const certificate = Iap2Csm.parseParams(frame.body).find((parameter: Iap2Param) => parameter.id === 0)?.value;
+    if (certificate === undefined || certificate.length === 0) {
+      throw new Error('车机 AA01 消息缺少 MFi 证书参数。');
+    }
+    this.log(`已收到 MFi 证书数据（${certificate.length} 字节）；正在验证证书链。`);
+    this.validatedAccessoryCertificate = await this.mfiVerifier.validateAccessoryCertificate(certificate);
+    if (!this.active) {
+      return;
+    }
     this.challengeLengths = this.prefer20ByteChallenge ? [20, 32, 16] : [32, 20, 16];
     this.challengeAttemptIndex = 0;
-    this.sendMfiChallenge();
+    await this.sendMfiChallenge();
   }
 
-  private sendMfiChallenge(): void {
-    if (!this.active || this.authenticationSent) {
+  private async sendMfiChallenge(): Promise<void> {
+    if (!this.active || this.authenticationSent || this.mfiFailed) {
       return;
     }
     if (this.challengeAttemptIndex >= this.challengeLengths.length) {
-      this.completeAuthentication('MFi 挑战档位均无应答或被拒；按发送端兼容流程继续。');
+      this.failAuthentication('所有兼容 MFi challenge 长度均失败；不会发送认证成功标记。');
       return;
     }
 
     const attemptIndex = this.challengeAttemptIndex;
     const length = this.challengeLengths[attemptIndex];
     try {
-      cryptoFramework.createRandom().generateRandom(length).then((random) => {
-        if (!this.active || this.authenticationSent || attemptIndex !== this.challengeAttemptIndex) {
-          return;
-        }
-        this.sendMessage(MFI_REQUEST_CHALLENGE, Iap2Csm.param(0, random.data));
-        this.log(`已发送 ${length} 字节 MFi 挑战（${attemptIndex + 1}/${this.challengeLengths.length}），等待车机响应。`);
-        this.challengeTimer = setTimeout(() => {
-          this.challengeTimer = -1;
-          this.retryMfiChallenge(`MFi ${length} 字节挑战超时。`);
-        }, length === 20 ? 6000 : 3000);
-      }, (error: Error) => {
-        if (this.active) {
-          this.log(`安全随机数生成失败，无法继续 MFi 挑战：${error.message}`);
-        }
-      });
-    } catch (error) {
-      if (this.active) {
-        this.log(`安全随机数服务不可用，无法继续 MFi 挑战：${error instanceof Error ? error.message : '未知错误'}`);
+      const random = await this.secureRandomBytes(length);
+      if (!this.active || this.authenticationSent || attemptIndex !== this.challengeAttemptIndex) {
+        random.fill(0);
+        return;
       }
+      this.clearPendingChallenge();
+      if (random.length !== length) {
+        random.fill(0);
+        throw new Error(`secure random provider returned ${random.length} bytes; expected ${length}`);
+      }
+      this.pendingMfiChallenge = random.slice();
+      random.fill(0);
+      this.sendMessage(MFI_REQUEST_CHALLENGE, Iap2Csm.param(0, this.pendingMfiChallenge));
+      this.log(`已发送 ${length} 字节 MFi challenge（${attemptIndex + 1}/${this.challengeLengths.length}），等待签名响应。`);
+      this.challengeTimer = setTimeout(() => {
+        this.challengeTimer = -1;
+        void this.retryMfiChallenge(`MFi ${length} 字节 challenge 超时。`);
+      }, length === 20 ? 6000 : 3000);
+    } catch (error) {
+      throw new Error(`安全随机数生成 MFi challenge 失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private retryMfiChallenge(reason: string): void {
-    if (!this.active || this.authenticationSent || !this.challengeStarted) {
+  private async retryMfiChallenge(reason: string): Promise<void> {
+    if (!this.active || this.authenticationSent || this.mfiFailed || !this.challengeStarted) {
       return;
     }
-    if (this.challengeTimer >= 0) {
-      clearTimeout(this.challengeTimer);
-      this.challengeTimer = -1;
-    }
+    this.clearChallengeTimer();
+    this.clearPendingChallenge();
     this.log(reason);
     this.challengeAttemptIndex++;
-    this.sendMfiChallenge();
+    await this.sendMfiChallenge();
   }
 
-  private completeAuthentication(reason: string): void {
-    if (!this.active || this.authenticationSent) {
+  private async completeMfiAuthentication(frame: Iap2CsmFrame): Promise<void> {
+    if (!this.active || this.authenticationSent || this.mfiFailed) {
       return;
     }
-    this.authenticationSent = true;
-    if (this.challengeTimer >= 0) {
-      clearTimeout(this.challengeTimer);
-      this.challengeTimer = -1;
+    const certificate = this.validatedAccessoryCertificate;
+    const challenge = this.pendingMfiChallenge;
+    const responseParameters = Iap2Csm.parseParams(frame.body);
+    const signature = responseParameters.find((parameter: Iap2Param) => parameter.id === 0)?.value;
+    if (certificate === undefined || challenge === undefined || signature === undefined || signature.length === 0) {
+      throw new Error(
+        `MFi AA03 响应缺少必需数据 (certificate=${certificate !== undefined}, ` +
+          `challenge=${challenge !== undefined}, signature=${signature !== undefined && signature.length > 0}, ` +
+          `parameterIds=${responseParameters.map((parameter: Iap2Param) => parameter.id).join(',')})。`
+      );
     }
-    this.log(reason);
+    this.clearChallengeTimer();
+    await this.mfiVerifier.verifyChallenge(certificate, challenge, signature);
+    if (!this.active) {
+      return;
+    }
+    this.clearPendingChallenge();
+    this.validatedAccessoryCertificate = undefined;
+    this.authenticationSent = true;
+    this.authenticated = true;
+    this.onMfiStage('authenticated');
+    this.log('MFi 证书链信任与 challenge 签名验证成功。');
     this.sendMessage(MFI_AUTHENTICATION_SUCCEEDED);
-    this.log('已发送 MFi 发送端成功标记。');
+    this.log('已发送 MFi 认证成功标记。');
+    this.beginPostAuthentication();
+  }
+
+  private beginPostAuthentication(): void {
     this.onWifiPending?.();
     const canReceiveWifiRequest = this.accessoryReceiveMessageIds?.has(REQUEST_ACCESSORY_WIFI_CONFIGURATION);
     const canSendWifiConfiguration = this.accessorySendMessageIds?.has(ACCESSORY_WIFI_CONFIGURATION);
@@ -254,9 +331,33 @@ export class Iap2SenderSession {
       this.log('已请求车机 Wi-Fi 配置。');
       return;
     }
-
     this.log('车机能力清单不支持旧版 Wi-Fi 配置交换，改用新版 0x4300 身份交换。');
     this.sendCarPlayAvailability();
+  }
+
+  private failAuthentication(reason: string): void {
+    if (this.mfiFailed || this.authenticationSent) {
+      return;
+    }
+    this.mfiFailed = true;
+    this.clearChallengeTimer();
+    this.clearPendingChallenge();
+    this.validatedAccessoryCertificate = undefined;
+    this.active = false;
+    this.log(`MFi 认证失败：${reason}`);
+    this.onFailure(reason);
+  }
+
+  private clearChallengeTimer(): void {
+    if (this.challengeTimer >= 0) {
+      clearTimeout(this.challengeTimer);
+      this.challengeTimer = -1;
+    }
+  }
+
+  private clearPendingChallenge(): void {
+    this.pendingMfiChallenge?.fill(0);
+    this.pendingMfiChallenge = undefined;
   }
 
   private sendCarPlayAvailability(): void {

@@ -7,6 +7,9 @@ import {
 } from '../main/ets/platform/bluetooth/HarmonyBluetoothIdentityProvider';
 import { Iap2SenderSession } from '../main/ets/protocol/iap2/Iap2SenderSession';
 import { Iap2Csm, Iap2CsmParser } from '../main/ets/protocol/iap2/Iap2Csm';
+import {
+  DeterministicMfiVerifier, authenticateTestAccessory, deterministicTestRandomBytes
+} from './Iap2MfiTestSupport';
 
 class FakeNativeBluetoothError extends Error {
   readonly code: number;
@@ -116,14 +119,17 @@ export default function harmonyBluetoothIdentityTest(): void {
       expect(await failureKind(provider)).assertEqual('identity-changed');
     });
 
-    it('uses the verified local identity in availability and the transport confirmation', 0, () => {
+    it('uses the verified local identity in availability and transport confirmation after MFi authentication', 0,
+      async () => {
       const sent: Uint8Array[] = [];
       const session = new Iap2SenderSession((bytes: Uint8Array) => { sent.push(bytes); },
-        () => {}, () => {}, undefined, undefined, '10:20:30:AA:BB:CC');
+        () => {}, () => {}, undefined, undefined, '10:20:30:AA:BB:CC',
+        undefined, undefined, new DeterministicMfiVerifier(), undefined, undefined, deterministicTestRandomBytes);
       const capabilities = new Uint8Array([...Iap2Csm.param(6, new Uint8Array([0x43, 0x01])),
         ...Iap2Csm.param(7, new Uint8Array([0x43, 0x00, 0x4E, 0x0E]))]);
       session.receive(Iap2Csm.encode(0x1D01, capabilities));
-      session.receive(Iap2Csm.encode(0xAA03));
+      await session.whenIdle();
+      await authenticateTestAccessory(session, sent);
       const availability = sent.map((bytes: Uint8Array) => new Iap2CsmParser().offer(bytes)[0])
         .find((frame) => frame.messageId === 0x4300);
       expect(availability !== undefined).assertTrue();
@@ -136,6 +142,7 @@ export default function harmonyBluetoothIdentityTest(): void {
       expect(wireless[0].value[0]).assertEqual(1);
       expect(Iap2Csm.asString(wireless[1])).assertEqual('10:20:30:AA:BB:CC');
       session.receive(Iap2Csm.encode(0x4301, Iap2Csm.u16(2, 7000)));
+      await session.whenIdle();
       const transport = sent.map((bytes: Uint8Array) => new Iap2CsmParser().offer(bytes)[0])
         .find((frame) => frame.messageId === 0x4E0E);
       expect(transport !== undefined).assertTrue();

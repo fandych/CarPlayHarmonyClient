@@ -202,7 +202,8 @@ class HarmonySettings {
 
   snapshot(): CarPlaySettingsSnapshot {
     const snapshot = this.store?.snapshot() ?? {
-      ready: false, busy: false, error: '', settings: defaultCarPlaySettings(), hasWifiPassword: false
+      ready: false, busy: false, error: '', settings: defaultCarPlaySettings(), hasWifiPassword: false,
+      trustedMfiFingerprints: []
     };
     snapshot.ready = snapshot.ready && this.initialized;
     snapshot.error = snapshot.error || this.platformError;
@@ -233,6 +234,17 @@ class HarmonySettings {
     const settings = this.snapshot().settings;
     settings.theme = theme;
     await this.save(settings, this.password());
+  }
+  trustedMfiFingerprints(): string[] {
+    return this.requireStore().snapshot().trustedMfiFingerprints;
+  }
+  async addTrustedMfiFingerprint(fingerprint: string): Promise<void> {
+    await this.requireStore().addTrustedMfiFingerprint(fingerprint);
+    carPlayDiagnostics.log('settings', '已保存车机 MFi 证书 SHA-256 信任指纹；该信任仅保存在本机，不进入配置导出。');
+  }
+  async removeTrustedMfiFingerprint(fingerprint: string): Promise<void> {
+    await this.requireStore().removeTrustedMfiFingerprint(fingerprint);
+    carPlayDiagnostics.log('settings', '已撤销一条本机 MFi 证书信任指纹。');
   }
   password(): string { return this.requireStore().password(); }
   async retryInitialization(): Promise<void> {

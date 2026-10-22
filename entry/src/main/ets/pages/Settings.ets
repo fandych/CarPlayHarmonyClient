@@ -11,6 +11,8 @@ struct Settings {
   @State private busy: boolean = false;
   @State private active: boolean = false;
   @State private fileBusy: boolean = false;
+  @State private pinBusy: boolean = false;
+  @State private trustedMfiFingerprints: string[] = [];
   @State private error: string = '';
   @State private localAddress: string = '';
   @State private deviceName: string = '';
@@ -38,6 +40,7 @@ struct Settings {
       this.ready = snapshot.ready;
       this.busy = snapshot.busy;
       this.error = snapshot.error;
+      this.trustedMfiFingerprints = snapshot.trustedMfiFingerprints;
       if (snapshot.ready && !this.draftLoaded) {
         this.loadDraft(snapshot.settings);
       }
@@ -122,6 +125,28 @@ struct Settings {
       showPageError(this.getUIContext(), '导出配置', error);
     } finally {
       this.fileBusy = false;
+    }
+  }
+  private async revokeMfiFingerprint(fingerprint: string): Promise<void> {
+    try {
+      const result = await this.getUIContext().getPromptAction().showDialog({
+        title: '撤销 MFi 证书信任',
+        message: `撤销指纹 ${fingerprint} 后，下次连接该证书时需要重新验证或确认信任。`,
+        buttons: [
+          { text: '取消', color: '#666666' },
+          { text: '撤销信任', color: '#D32F2F' }
+        ]
+      });
+      if (result.index !== 1) {
+        return;
+      }
+      this.pinBusy = true;
+      await carPlaySettings.removeTrustedMfiFingerprint(fingerprint);
+      this.getUIContext().getPromptAction().showToast({ message: '已撤销 MFi 证书信任。' });
+    } catch (error) {
+      showPageError(this.getUIContext(), '撤销 MFi 信任', error);
+    } finally {
+      this.pinBusy = false;
     }
   }
   private refreshDevices(): void {
@@ -235,6 +260,24 @@ struct Settings {
           .width('100%')
           Text('私钥、证书、配对证明和系统权限不属于可手填配置。')
             .fontSize(12).fontColor($r('app.color.secondary_text')).width('100%')
+
+          this.section('MFi 证书信任', '仅对你确认过 SHA-256 指纹的车机证书保存本机信任。指纹不会随设置 JSON 导出。')
+          if (this.trustedMfiFingerprints.length === 0) {
+            Text('尚无已确认的 MFi 证书指纹。')
+              .fontSize(13).fontColor($r('app.color.secondary_text')).width('100%')
+          }
+          ForEach(this.trustedMfiFingerprints, (fingerprint: string) => {
+            Column({ space: 8 }) {
+              Text(fingerprint).fontSize(12).fontColor($r('app.color.primary_text')).width('100%')
+              Button('撤销此证书信任')
+                .enabled(!this.active && !this.busy && !this.pinBusy && !this.fileBusy)
+                .onClick(() => { void this.revokeMfiFingerprint(fingerprint); })
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor($r('app.color.card_background'))
+            .borderRadius(10)
+          }, (fingerprint: string) => fingerprint)
         }
         .width('100%')
         .padding({ bottom: 32 })

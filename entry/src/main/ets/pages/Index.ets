@@ -2,6 +2,7 @@ import { carPlaySessionController, CarPlaySessionState, isCarPlaySessionActive }
 import { CarPlayTheme } from '../app/settings/CarPlaySettings';
 import { carPlaySettings } from '../platform/settings/HarmonySettings';
 import { showPageError } from '../components/PageHeader';
+import { MfiTrustPromptInfo } from '../protocol/iap2/MfiVerifier';
 
 @Entry
 @Component
@@ -17,12 +18,18 @@ struct Index {
   @State private blockedReason: string = '';
   private unsubscribeSession: (() => void) | undefined = undefined;
   private unsubscribeSettings: (() => void) | undefined = undefined;
+  private presentedMfiTrustFingerprint: string = '';
 
   aboutToAppear(): void {
     this.unsubscribeSession = carPlaySessionController.subscribe((snapshot) => {
       this.state = snapshot.state;
       this.deviceName = snapshot.connectedDeviceName;
       this.blockedReason = snapshot.blockedReason;
+      const trustRequest = snapshot.mfiTrustRequest;
+      if (trustRequest !== undefined && trustRequest.fingerprint !== this.presentedMfiTrustFingerprint) {
+        this.presentedMfiTrustFingerprint = trustRequest.fingerprint;
+        void this.presentMfiTrustRequest(trustRequest);
+      }
     });
     this.unsubscribeSettings = carPlaySettings.subscribe((snapshot) => {
       this.carPlayEnabled = snapshot.settings.enabled;
@@ -34,10 +41,37 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    if (this.presentedMfiTrustFingerprint.length > 0) {
+      carPlaySessionController.approveMfiTrust(this.presentedMfiTrustFingerprint, false);
+      this.presentedMfiTrustFingerprint = '';
+    }
     this.unsubscribeSession?.();
     this.unsubscribeSettings?.();
     this.unsubscribeSession = undefined;
     this.unsubscribeSettings = undefined;
+  }
+
+  private async presentMfiTrustRequest(info: MfiTrustPromptInfo): Promise<void> {
+    try {
+      const response = await this.getUIContext().getPromptAction().showDialog({
+        title: '确认车机 MFi 证书信任',
+        message: `系统无法验证此证书的颁发链。只有在你确认正在连接自己的车机/DiPlay 时才信任。\n\n` +
+          `主体：${info.subject}\n颁发者：${info.issuer}\nSHA-256：${info.fingerprint}\n\n` +
+          `${info.pkixFailure}\n\n同意后仅在本机保存此指纹；仍会验证 MFi challenge 签名。`,
+        buttons: [
+          { text: '拒绝', color: '#666666' },
+          { text: '信任此证书', color: '#007DFF' }
+        ]
+      });
+      carPlaySessionController.approveMfiTrust(info.fingerprint, response.index === 1);
+    } catch (error) {
+      carPlaySessionController.approveMfiTrust(info.fingerprint, false);
+      showPageError(this.getUIContext(), 'MFi 证书信任确认', error);
+    } finally {
+      if (this.presentedMfiTrustFingerprint === info.fingerprint) {
+        this.presentedMfiTrustFingerprint = '';
+      }
+    }
   }
 
   private async changeEnabled(value: boolean): Promise<void> {
@@ -60,6 +94,7 @@ struct Index {
       case 'bluetooth-connected': return '蓝牙通道已连接，CarPlay 尚未建立';
       case 'iap2-negotiating': return '正在协商 iAP2 链路，CarPlay 尚未建立';
       case 'iap2-ready': return 'iAP2 已就绪，等待车机网络信息';
+      case 'mfi-authenticating': return '已读取车机身份，正在验证 MFi 证书与 challenge 签名';
       case 'wifi-pending': return '正在确认并加入车机 Wi-Fi';
       case 'wifi-connected': return '车机 Wi-Fi 已连接，等待邀请/端点';
       case 'airplay-found': return '已发现 AirPlay 服务，尚未开始视频投屏';

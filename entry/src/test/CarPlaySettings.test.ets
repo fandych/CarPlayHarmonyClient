@@ -160,6 +160,40 @@ export default function carPlaySettingsTest(): void {
       expect(second.snapshot().settings.theme).assertEqual('dark');
       expect(second.password()).assertEqual('private-wifi-password');
     });
+    it('persists local MFi trust pins but excludes them from configuration JSON', 0, async () => {
+      const disk = new MemorySettingsPersistence();
+      const vault = new MemoryWifiVault();
+      const fingerprint = 'a'.repeat(64);
+      const first = storeFor(disk, vault);
+      await first.load();
+      await first.addTrustedMfiFingerprint(fingerprint);
+      expect(first.snapshot().trustedMfiFingerprints.length).assertEqual(1);
+      expect(first.exportJson().includes(fingerprint)).assertFalse();
+
+      const reopened = storeFor(disk, vault);
+      await reopened.load();
+      expect(reopened.snapshot().trustedMfiFingerprints[0]).assertEqual(fingerprint);
+      await reopened.removeTrustedMfiFingerprint(fingerprint);
+      const afterRevoke = storeFor(disk, vault);
+      await afterRevoke.load();
+      expect(afterRevoke.snapshot().trustedMfiFingerprints.length).assertEqual(0);
+    });
+    it('rejects malformed MFi trust pins without replacing existing settings', 0, async () => {
+      const disk = new MemorySettingsPersistence();
+      const vault = new MemoryWifiVault();
+      const store = storeFor(disk, vault);
+      await store.load();
+      await store.save(configured(), '');
+      const original = disk.raw;
+      let rejected = false;
+      try {
+        await store.addTrustedMfiFingerprint('not-a-sha256');
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).assertTrue();
+      expect(disk.raw).assertEqual(original);
+    });
     it('keeps snapshot objects isolated from the committed configuration', 0, async () => {
       const store = storeFor(new MemorySettingsPersistence(), new MemoryWifiVault());
       await store.load();
