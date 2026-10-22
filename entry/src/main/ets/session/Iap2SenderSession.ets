@@ -12,7 +12,7 @@ import {
   stringParameter
 } from '../protocol/Iap2Codec';
 import cryptoFramework from '@ohos.security.cryptoFramework';
-import { MfiVerifier, ValidatedMfiCertificate } from '../iap2/MfiVerifier';
+import { MfiTrustPromptInfo, MfiVerifier, ValidatedMfiCertificate } from '../iap2/MfiVerifier';
 
 const LINK_MARKER: Uint8Array = new Uint8Array([0xff, 0x55, 0x02, 0x00, 0xee, 0x10]);
 interface Iap2MessageIds {
@@ -103,7 +103,10 @@ export class Iap2SenderSession {
     deviceAddress: string,
     deviceName: string,
     deviceUuid: string,
-    allowMfiIntermediateDownload: boolean = false
+    allowMfiIntermediateDownload: boolean = false,
+    trustedMfiFingerprints: string[] = [],
+    requestMfiTrust?: (info: MfiTrustPromptInfo) => Promise<boolean>,
+    persistMfiFingerprint?: (fingerprint: string) => Promise<void>
   ) {
     this.sendBytes = sendBytes;
     this.log = log;
@@ -112,7 +115,13 @@ export class Iap2SenderSession {
     this.deviceAddress = deviceAddress;
     this.deviceName = deviceName;
     this.deviceUuid = deviceUuid;
-    this.mfiVerifier = new MfiVerifier(log, allowMfiIntermediateDownload);
+    this.mfiVerifier = new MfiVerifier(
+      log,
+      allowMfiIntermediateDownload,
+      trustedMfiFingerprints,
+      requestMfiTrust,
+      persistMfiFingerprint
+    );
   }
 
   get isAccessoryVerified(): boolean {

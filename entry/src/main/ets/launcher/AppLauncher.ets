@@ -41,15 +41,45 @@ export class AppLauncher {
     throw new Error(`应用 ${normalized} 没有可由其他应用启动的 UIAbility`);
   }
 
-  async launch(context: common.UIAbilityContext, target: AppLaunchTarget): Promise<void> {
+  async launch(
+    context: common.UIAbilityContext,
+    target: AppLaunchTarget,
+    displayId?: number
+  ): Promise<void> {
     const want: Want = new Want();
     want.bundleName = target.bundleName;
     want.abilityName = target.abilityName;
+    if (displayId !== undefined && (!Number.isInteger(displayId) || displayId <= 0)) {
+      throw new Error(`虚拟屏 ID 无效：${displayId}`);
+    }
     try {
-      await context.startAbility(want);
+      if (displayId === undefined) {
+        await context.startAbility(want);
+      } else {
+        await context.startAbility(want, { displayId });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`启动应用 ${target.label} 失败：${message}`);
+      const destination = displayId === undefined ? '手机' : `CarPlay 屏幕 ${displayId}`;
+      throw new Error(`在${destination}启动应用 ${target.label} 失败：${message}`);
+    }
+  }
+
+  async launchProjectionHome(context: common.UIAbilityContext, displayId: number): Promise<void> {
+    if (!Number.isInteger(displayId) || displayId <= 0) {
+      throw new Error(`虚拟屏 ID 无效：${displayId}`);
+    }
+    const bundleName = bundleManager.getBundleInfoForSelfSync(
+      bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT
+    ).name;
+    const want: Want = new Want();
+    want.bundleName = bundleName;
+    want.abilityName = 'ProjectionHomeAbility';
+    try {
+      await context.startAbility(want, { displayId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`启动 CarPlay 投屏桌面失败：${message}`);
     }
   }
 }

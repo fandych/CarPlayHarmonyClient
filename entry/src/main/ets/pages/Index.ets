@@ -1,11 +1,14 @@
 import common from '@ohos.app.ability.common';
 import image from '@ohos.multimedia.image';
+import promptAction from '@ohos.promptAction';
 import { AudioRtpSender, AudioRtpSession } from '../audio/AudioRtpSender';
 import { PlaybackAudioCapture } from '../audio/PlaybackAudioCapture';
-import { AirPlayPairingClient } from '../airplay/AirPlayPairingClient';
+import { AirPlayMediaSessionInfo } from '../airplay/AirPlayMediaSession';
+import { MfiTrustPromptInfo } from '../iap2/MfiVerifier';
 import { AppLaunchTarget, AppLauncher } from '../launcher/AppLauncher';
 import { AirPlayService } from '../network/AirPlayMdnsDiscovery';
 import { SessionController, SessionEvents } from '../session/SessionController';
+import { appendConnectionLog } from '../session/ConnectionLogBuffer';
 import { WifiCredentials } from '../session/Iap2SenderSession';
 import { AppSettingsStore, CarDeckAppSettings } from '../settings/AppSettingsStore';
 import { BackgroundPhotoPicker } from '../settings/BackgroundPhotoPicker';
@@ -30,11 +33,8 @@ const DEFAULT_MAP_APPS: MapAppCandidate[] = [
 struct Index {
   @State status: string = '未连接';
   @State isStarting: boolean = false;
+  @State isStopping: boolean = false;
   @State isJoiningWifi: boolean = false;
-  @State isPairingAirPlay: boolean = false;
-  @State isStartingAirPlayMedia: boolean = false;
-  @State canStartAirPlayMedia: boolean = false;
-  @State airPlayMediaStatus: string = '尚未建立媒体会话';
   @State settingsReady: boolean = false;
   @State settingsError: string = '';
   @State disclaimerAccepted: boolean = false;
@@ -43,6 +43,7 @@ struct Index {
   @State isSessionActive: boolean = false;
   @State keepScreenOn: boolean = true;
   @State allowMfiIntermediateDownload: boolean = false;
+  @State trustedMfiFingerprints: string[] = [];
   @State isAudioCaptureRequesting: boolean = false;
   @State isAudioCapturing: boolean = false;
   @State audioCaptureStatus: string = '未请求系统播放音频捕获';
@@ -61,11 +62,11 @@ struct Index {
   @State backgroundPhotoThumbnail: image.PixelMap | undefined = undefined;
   @State backgroundPhotoStatus: string = '未选择背景图';
   @State virtualScreenPermissionStatus: string = '尚未检测';
+  @State projectionDisplayId: number = -1;
   @State settingsMessage: string = '';
-  @State airPlayEndpoint: string = '尚未发现接收端';
-  @State airPlayDetails: string = '';
-  @State airPlayPairingStatus: string = '尚未开始 AirPlay 配对';
   @State logs: string[] = [];
+  @State logAtBottom: boolean = true;
+  private readonly logScroller: Scroller = new Scroller();
   private controller?: SessionController;
   private readonly settingsStore: AppSettingsStore = new AppSettingsStore();
   private readonly appLauncher: AppLauncher = new AppLauncher();
@@ -75,8 +76,6 @@ struct Index {
   private playbackCapture?: PlaybackAudioCapture;
   private audioRtpSender?: AudioRtpSender;
   private audioRtpSession?: AudioRtpSession;
-  private discoveredAirPlay?: AirPlayService;
-  private activePairing?: AirPlayPairingClient;
   private disclaimerTimer: number = -1;
   private audioStatsTimer: number = -1;
   private pendingAudioBytes: number = 0;
@@ -87,43 +86,6 @@ struct Index {
       this.settingsError = error.message;
       this.settingsReady = true;
     });
-  }
-
-  private async pairAirPlay(): Promise<void> {
-    const service = this.discoveredAirPlay;
-    if (!service) {
-      this.showError(new Error('尚未发现 AirPlay 接收端'));
-      return;
-    }
-    if (this.activePairing) {
-      try {
-        await this.activePairing.close();
-      } catch (error) {
-        this.addLog(`关闭旧 AirPlay 会话失败：${error instanceof Error ? error.message : String(error)}`);
-      }
-      this.activePairing = undefined;
-    }
-    this.canStartAirPlayMedia = false;
-    this.audioRtpSession = undefined;
-    this.airPlayMediaStatus = '等待安全配对';
-    const pairing = new AirPlayPairingClient((message: string): void => this.addLog(message));
-    this.activePairing = pairing;
-    this.isPairingAirPlay = true;
-    this.airPlayPairingStatus = '正在校验 AirPlay SRP/Ed25519/X25519 配对';
-    try {
-      const result = await pairing.pair(this.getAppContext(), service);
-      this.airPlayPairingStatus =
-        `已验证配对：${result.receiverId} · ${result.model} · ${result.features}`;
-      this.canStartAirPlayMedia = true;
-      this.airPlayMediaStatus = '配对完成；可尝试 RTSP 媒体会话';
-      this.status = 'AirPlay 控制通道已加密';
-    } catch (error) {
-      this.activePairing = undefined;
-      this.airPlayPairingStatus = `AirPlay 配对失败：${error instanceof Error ? error.message : String(error)}`;
-      this.showError(error);
-    } finally {
-      this.isPairingAirPlay = false;
-    }
   }
 
   aboutToDisappear(): void {
@@ -145,15 +107,14 @@ struct Index {
           this.navigationBar()
           if (this.activeTab === 'connect') {
             this.connectionCard()
-            this.wifiCard()
-            this.airPlayCard()
-            this.limitationCard()
             this.logCard()
           } else if (this.activeTab === 'apps') {
             this.appsPage()
           } else if (this.activeTab === 'settings') {
             this.identityCard()
+            this.wifiCard()
             this.keepScreenCard()
+            this.mfiTrustCard()
             this.virtualScreenPermissionCard()
             this.backgroundPhotoCard()
             this.audioCaptureCard()
@@ -290,10 +251,20 @@ struct Index {
         .fontSize(18)
         .fontWeight(FontWeight.Bold)
         .fontColor('#17243A')
-      Text('填写 bundle name 添加快捷方式；应用目前只在手机上启动。')
+      Text(this.projectionDisplayId > 0
+        ? '已建立 CarPlay 虚拟屏；启动应用会投放到车机。'
+        : '添加应用快捷方式。未连接 CarPlay 时会在手机打开；已连接时可投放到车机。')
         .fontSize(12)
         .fontColor('#69788E')
         .width('100%')
+      if (this.projectionDisplayId > 0) {
+        Button('显示 CarPlay 桌面 / 背景图')
+          .width('100%')
+          .height(40)
+          .backgroundColor('#EAF2FF')
+          .fontColor('#1769E0')
+          .onClick(() => this.showProjectionHome())
+      }
       Button('扫描常见地图应用')
         .width('100%')
         .height(42)
@@ -335,7 +306,7 @@ struct Index {
           }
           .layoutWeight(1)
           .alignItems(HorizontalAlign.Start)
-          Button('启动')
+          Button(this.projectionDisplayId >= 0 ? '投放' : '手机打开')
             .fontSize(12)
             .onClick(() => this.launchFavorite(target))
           Button('移除')
@@ -405,6 +376,48 @@ struct Index {
       Text(this.settingsMessage)
         .fontSize(12)
         .fontColor('#536279')
+    }
+    .width('100%')
+    .padding(16)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(18)
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  private mfiTrustCard() {
+    Column({ space: 10 }) {
+      Text('MFi 证书指纹信任')
+        .fontSize(17)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#17243A')
+      Text(this.trustedMfiFingerprints.length === 0
+        ? '尚无人工固定的证书'
+        : `已固定 ${this.trustedMfiFingerprints.length} 个证书指纹`)
+        .fontSize(12)
+        .fontColor('#69788E')
+      ForEach(this.trustedMfiFingerprints, (fingerprint: string) => {
+        Row({ space: 8 }) {
+          Text(fingerprint)
+            .fontSize(9)
+            .fontColor('#31435C')
+            .layoutWeight(1)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Button('撤销')
+            .fontSize(11)
+            .enabled(!this.isSessionActive)
+            .onClick(() => this.revokeMfiFingerprint(fingerprint))
+        }
+        .width('100%')
+        .padding(8)
+        .backgroundColor('#F4F6F9')
+        .borderRadius(8)
+      }, (fingerprint: string) => fingerprint)
+      Text('只固定完整 SHA-256 指纹。每次连接仍验证 challenge 签名；人工固定不代表 Apple/MFi 官方认证。')
+        .fontSize(11)
+        .fontColor('#9B4B00')
+        .width('100%')
     }
     .width('100%')
     .padding(16)
@@ -522,7 +535,7 @@ struct Index {
         .backgroundColor('#172F56')
         .fontColor('#FFFFFF')
         .onClick(() => this.checkVirtualScreenPermission())
-      Text('只检测授权，不创建屏幕。未授予时需系统签名；普通应用不能申请。')
+      Text('只检测授权，不创建屏幕。需设备系统签名/白名单；触摸回注还需授权输入服务。')
         .fontSize(11)
         .fontColor('#9B4B00')
         .width('100%')
@@ -592,10 +605,6 @@ struct Index {
       .width('100%')
       .justifyContent(FlexAlign.Start)
 
-      Text('让手机尝试以发送端身份连接支持无线 CarPlay 的车机。请先在系统设置中完成蓝牙配对。')
-        .fontSize(14)
-        .fontColor('#536279')
-        .width('100%')
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
@@ -603,45 +612,39 @@ struct Index {
 
   @Builder
   private connectionCard() {
-    Column({ space: 14 }) {
-      Row() {
-        Text('连接状态')
-          .fontSize(17)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#17243A')
-        Blank()
-        Text(this.isStarting ? '启动中' : 'API 26')
-          .fontSize(12)
-          .fontColor('#1769E0')
-          .padding({ left: 9, right: 9, top: 5, bottom: 5 })
-          .backgroundColor('#EAF2FF')
-          .borderRadius(12)
+    Column({ space: 16 }) {
+      Row({ space: 14 }) {
+        Column({ space: 5 }) {
+          Text('CarPlay')
+            .fontSize(20)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#17243A')
+          Text(this.isStarting ? '正在启动…' : this.status)
+            .fontSize(13)
+            .fontColor('#536279')
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Toggle({ type: ToggleType.Switch, isOn: this.isSessionActive })
+          .enabled(!this.isStarting && !this.isStopping)
+          .onChange((enabled: boolean): void => {
+            if (enabled) {
+              void this.startSession();
+            } else {
+              void this.stopSession();
+            }
+          })
       }
       .width('100%')
-
-      Text(this.status)
-        .fontSize(15)
-        .fontColor('#31435C')
+      Text(this.isSessionActive
+        ? 'iAP2 → MFi → Wi-Fi 确认 → AirPlay'
+        : '开启后等待车机蓝牙 iAP2 握手')
+        .fontSize(11)
+        .fontColor('#69788E')
         .width('100%')
-
-      Row({ space: 10 }) {
-        Button(this.isStarting ? '正在启动…' : '启动蓝牙监听')
-          .layoutWeight(1)
-          .height(48)
-          .fontSize(15)
-          .fontWeight(FontWeight.Medium)
-          .backgroundColor('#1769E0')
-          .enabled(!this.isStarting)
-          .onClick(() => this.startSession())
-        Button('停止')
-          .width(82)
-          .height(48)
-          .fontSize(15)
-          .fontColor('#37465A')
-          .backgroundColor('#E9EDF3')
-          .onClick(() => this.stopSession())
-      }
-      .width('100%')
     }
     .width('100%')
     .padding(16)
@@ -729,102 +732,48 @@ struct Index {
   }
 
   @Builder
-  private airPlayCard() {
+  private logCard() {
     Column({ space: 8 }) {
       Row() {
-        Text('AirPlay 接收端')
-          .fontSize(17)
+        Text('连接日志')
+          .fontSize(16)
           .fontWeight(FontWeight.Bold)
           .fontColor('#17243A')
         Blank()
-        Text('mDNS')
+        Button('到底部')
           .fontSize(11)
-          .fontColor('#69788E')
+          .height(30)
+          .onClick(() => this.scrollLogsToBottom())
       }
       .width('100%')
-      Text(this.airPlayEndpoint)
-        .fontSize(14)
-        .fontColor('#31435C')
+      Scroll(this.logScroller) {
+        Column({ space: 5 }) {
+          if (this.logs.length === 0) {
+            Text('开启 CarPlay 后，握手与连接进度会显示在这里')
+              .fontSize(12)
+              .fontColor('#8B98A9')
+              .width('100%')
+          }
+          ForEach(this.logs, (entry: string) => {
+            Text(entry)
+              .fontSize(11)
+              .fontColor('#536279')
+              .width('100%')
+          }, (entry: string) => entry)
+        }
         .width('100%')
-      if (this.airPlayDetails.length > 0) {
-        Text(this.airPlayDetails)
-          .fontSize(12)
-          .fontColor('#69788E')
-          .width('100%')
+        .alignItems(HorizontalAlign.Start)
       }
-      Text(this.airPlayPairingStatus)
-        .fontSize(12)
-        .fontColor('#31435C')
-        .width('100%')
-      Button(this.isPairingAirPlay ? '正在验证 AirPlay 配对…' : '尝试安全 AirPlay 配对')
-        .width('100%')
-        .height(44)
-        .backgroundColor('#172F56')
-        .fontColor('#FFFFFF')
-        .enabled(!this.isPairingAirPlay && this.discoveredAirPlay !== undefined)
-        .onClick(() => this.pairAirPlay())
-      if (this.canStartAirPlayMedia) {
-        Button(this.isStartingAirPlayMedia ? '正在协商媒体会话…' : '建立 RTSP 媒体会话')
-          .width('100%')
-          .height(44)
-          .backgroundColor('#1769E0')
-          .fontColor('#FFFFFF')
-          .enabled(!this.isStartingAirPlayMedia)
-          .onClick(() => this.startAirPlayMediaSession())
-        Text(this.airPlayMediaStatus)
-          .fontSize(12)
-          .fontColor('#69788E')
-          .width('100%')
-      }
-      Text('视频编码和跨应用投屏尚未接通。')
-        .fontSize(12)
-        .fontColor('#B15B00')
-        .width('100%')
-    }
-    .width('100%')
-    .padding(16)
-    .backgroundColor('#FFFFFF')
-    .borderRadius(18)
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  private limitationCard() {
-    Column({ space: 8 }) {
-      Text('当前平台边界')
-        .fontSize(16)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#17243A')
-      Text('投屏还需要受信虚拟屏权限，以及视频、音频和触控通道；当前尚未连通。')
-        .fontSize(12)
-        .fontColor('#69788E')
-        .width('100%')
-    }
-    .width('100%')
-    .padding(16)
-    .backgroundColor('#FFF8E9')
-    .borderRadius(18)
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  private logCard() {
-    Column({ space: 8 }) {
-      Text('会话日志')
-        .fontSize(16)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#17243A')
-      ForEach(this.logs, (entry: string) => {
-        Text(entry)
-          .fontSize(11)
-          .fontColor('#536279')
-          .width('100%')
-      }, (entry: string) => entry)
-      if (this.logs.length === 0) {
-        Text('尚无日志')
-          .fontSize(12)
-          .fontColor('#8B98A9')
-      }
+      .width('100%')
+      .height(360)
+      .scrollBar(BarState.Auto)
+      .backgroundColor('#F7F8FA')
+      .borderRadius(10)
+      .padding(10)
+      .onScroll((_xOffset: number, yOffset: number): void => {
+        const contentHeight = this.logScroller.contentSize().height;
+        this.logAtBottom = contentHeight - yOffset <= 400;
+      })
     }
     .width('100%')
     .padding(16)
@@ -842,6 +791,7 @@ struct Index {
     this.wifiSsid = settings.lastSsid;
     this.keepScreenOn = settings.keepScreenOn;
     this.allowMfiIntermediateDownload = settings.allowMfiIntermediateDownload;
+    this.trustedMfiFingerprints = settings.trustedMfiFingerprints;
     this.favoriteBundles = settings.favoriteBundles;
     this.backgroundPhotoUri = settings.backgroundPhotoUri;
     if (this.backgroundPhotoUri.length > 0) {
@@ -883,6 +833,7 @@ struct Index {
       lastSsid: this.wifiSsid.trim(),
       keepScreenOn: this.keepScreenOn,
       allowMfiIntermediateDownload: this.allowMfiIntermediateDownload,
+      trustedMfiFingerprints: this.trustedMfiFingerprints.slice(),
       favoriteBundles: this.favoriteBundles.slice(),
       backgroundPhotoUri: this.backgroundPhotoUri
     };
@@ -950,6 +901,64 @@ struct Index {
     }
   }
 
+  private async confirmMfiFingerprintTrust(info: MfiTrustPromptInfo): Promise<boolean> {
+    const options: promptAction.ShowDialogOptions = {
+      title: '是否固定并信任此证书？',
+      message:
+        '确认后仅在本应用中固定这个确切的叶证书 SHA-256 指纹，不会写入系统证书库。' +
+        '人工固定会覆盖系统对证书链、KeyUsage 和未知 critical extension 的验证；应用仍会检查证书有效期，' +
+        '且每次连接都必须通过 iAP2 challenge 签名验证。人工固定不代表 Apple/MFi 官方认证。\n\n' +
+        `Subject: ${info.subject}\nIssuer: ${info.issuer}\nSHA-256: ${info.fingerprint}\n\n` +
+        `PKIX: ${info.pkixFailure}`,
+      buttons: [
+        { text: '拒绝', color: '#69788E' },
+        { text: '信任并固定指纹', color: '#B15B00' }
+      ]
+    };
+    try {
+      const response = await promptAction.showDialog(options);
+      const approved = response.index === 1;
+      this.addLog(`MFi 证书信任决策：${approved ? '用户同意' : '用户拒绝'} ${info.fingerprint}`);
+      return approved;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.addLog(`MFi 信任确认窗口未完成，按拒绝处理：${message}`);
+      return false;
+    }
+  }
+
+  private async persistMfiFingerprint(fingerprint: string): Promise<void> {
+    const normalized = fingerprint.toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(normalized)) {
+      throw new Error('MFi 指纹不是有效 SHA-256，拒绝保存');
+    }
+    if (this.trustedMfiFingerprints.includes(normalized)) {
+      return;
+    }
+    const previous = this.trustedMfiFingerprints;
+    this.trustedMfiFingerprints = [...previous, normalized];
+    try {
+      await this.persistSettings();
+      this.addLog(`MFi 指纹已在 challenge 签名验证成功后保存：${normalized}`);
+    } catch (error) {
+      this.trustedMfiFingerprints = previous;
+      throw new Error(`保存 MFi 指纹失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async revokeMfiFingerprint(fingerprint: string): Promise<void> {
+    const previous = this.trustedMfiFingerprints;
+    this.trustedMfiFingerprints = previous.filter((item: string) => item !== fingerprint);
+    try {
+      await this.persistSettings();
+      this.settingsMessage = '已撤销 MFi 指纹信任';
+      this.addLog(`已撤销 MFi 指纹：${fingerprint}`);
+    } catch (error) {
+      this.trustedMfiFingerprints = previous;
+      this.showError(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
   private async chooseBackgroundPhoto(): Promise<void> {
     try {
       const selected = await this.backgroundPhotoPicker.pick(this.getAppContext());
@@ -992,9 +1001,11 @@ struct Index {
 
   private checkVirtualScreenPermission(): void {
     try {
-      this.virtualScreenPermissionStatus = this.virtualScreenPermissionProbe.hasAccess()
-        ? '已授予：可继续实测虚拟屏 API'
-        : '未授予：当前 HAP 无虚拟屏权限';
+      const virtualScreen = this.virtualScreenPermissionProbe.hasAccess();
+      const inputInjection = this.virtualScreenPermissionProbe.hasTouchControl();
+      this.virtualScreenPermissionStatus =
+        `虚拟屏 ${virtualScreen ? '已授予' : '未授予'}；` +
+        `跨应用输入 ${inputInjection ? '已授予' : '未授予'}`;
     } catch (error) {
       this.virtualScreenPermissionStatus =
         `检测失败：${error instanceof Error ? error.message : String(error)}`;
@@ -1004,6 +1015,9 @@ struct Index {
 
   private selectTab(tab: string): void {
     this.activeTab = tab;
+    if (tab === 'connect') {
+      this.scrollLogsToBottom();
+    }
     if (tab === 'apps' && !this.mapDiscoveryDone) {
       void this.discoverMapApps();
     }
@@ -1114,8 +1128,25 @@ struct Index {
 
   private async launchFavorite(target: AppLaunchTarget): Promise<void> {
     try {
-      await this.appLauncher.launch(this.getAppContext(), target);
-      this.status = `已请求启动 ${target.label}`;
+      if (this.projectionDisplayId > 0) {
+        await this.appLauncher.launch(this.getAppContext(), target, this.projectionDisplayId);
+        this.status = `已请求将 ${target.label} 投放到 CarPlay`;
+      } else {
+        await this.appLauncher.launch(this.getAppContext(), target);
+        this.status = `已请求在手机启动 ${target.label}`;
+      }
+    } catch (error) {
+      this.showError(error);
+    }
+  }
+
+  private async showProjectionHome(): Promise<void> {
+    if (this.projectionDisplayId <= 0) {
+      return;
+    }
+    try {
+      await this.appLauncher.launchProjectionHome(this.getAppContext(), this.projectionDisplayId);
+      this.settingsMessage = 'CarPlay 桌面和背景图已投放';
     } catch (error) {
       this.showError(error);
     }
@@ -1247,15 +1278,48 @@ struct Index {
         onWifiCredentials: (credentials: WifiCredentials): void => {
           this.wifiSsid = credentials.ssid;
           this.wifiPassword = credentials.password;
-          this.addLog(`收到热点凭据：${credentials.ssid}（密码不写入日志）`);
+          this.addLog(`iAP2 收到热点凭据：${credentials.ssid}（密码不记录）`);
         },
         onAirPlayService: (service: AirPlayService): void => {
-          this.discoveredAirPlay = service;
-          this.airPlayEndpoint = `${service.name} · ${service.host}:${service.port}`;
-          const identifier = service.txt['deviceid'] ?? service.txt['pi'] ?? '';
-          const features = service.txt['features'] ?? '';
-          this.airPlayDetails = `deviceid=${identifier || '未提供'} · features=${features || '未提供'}`;
-        }
+          this.addLog(`AirPlay 服务已解析：${service.name} · ${service.host}:${service.port}`);
+        },
+        onAirPlayMediaSession: (info: AirPlayMediaSessionInfo): void => {
+          this.audioRtpSession = info.audioSession;
+          this.status = `RTSP 会话已建立；音频${info.audioSession ? '可用' : '不可用'}；正在启动 H.264 视频`;
+          this.addLog(`RTSP RECORD 已完成；screen=${info.videoDataPort}，audio=${info.audioSession?.dataPort ?? 0}`);
+        },
+        onProjectionReady: async (displayId: number, width: number, height: number): Promise<void> => {
+          this.projectionDisplayId = displayId;
+          this.addLog(`CarPlay 虚拟屏就绪：${displayId} (${width}x${height})`);
+          try {
+            if (this.favoriteTargets.length === 0 && this.favoriteBundles.length > 0) {
+              await this.loadFavoriteTargets();
+            }
+            const target = this.favoriteTargets[0];
+            if (target) {
+              try {
+                await this.appLauncher.launch(context, target, displayId);
+                this.addLog(`默认应用已启动到 CarPlay：${target.label}`);
+                return;
+              } catch (error) {
+                this.addLog(
+                  `默认应用不能启动到 CarPlay 屏幕：${error instanceof Error ? error.message : String(error)}`
+                );
+              }
+            }
+            await this.appLauncher.launchProjectionHome(context, displayId);
+            this.addLog('已启动 CarPlay 本地桌面');
+          } catch (error) {
+            this.addLog(`CarPlay 桌面启动失败：${error instanceof Error ? error.message : String(error)}`);
+          }
+        },
+        onProjectionStopped: (): void => {
+          this.projectionDisplayId = -1;
+        },
+        requestMfiTrust: (info: MfiTrustPromptInfo): Promise<boolean> =>
+          this.confirmMfiFingerprintTrust(info),
+        persistMfiFingerprint: (fingerprint: string): Promise<void> =>
+          this.persistMfiFingerprint(fingerprint)
       };
       this.controller = new SessionController(
         context,
@@ -1264,7 +1328,8 @@ struct Index {
         this.deviceName,
         this.deviceUuid || this.createDeviceUuid(),
         this.keepScreenOn,
-        this.allowMfiIntermediateDownload
+        this.allowMfiIntermediateDownload,
+        this.trustedMfiFingerprints
       );
     }
     return this.controller;
@@ -1272,10 +1337,11 @@ struct Index {
 
   private async startSession(): Promise<void> {
     this.isStarting = true;
+    this.isSessionActive = true;
     try {
       await this.ensureController().start();
-      this.isSessionActive = true;
     } catch (error) {
+      this.isSessionActive = false;
       this.showError(error);
     } finally {
       this.isStarting = false;
@@ -1283,6 +1349,11 @@ struct Index {
   }
 
   private async stopSession(): Promise<void> {
+    if (this.isStopping) {
+      return;
+    }
+    this.isStopping = true;
+    this.isSessionActive = false;
     const failures: string[] = [];
     try {
       await this.stopAudioCapture();
@@ -1294,50 +1365,14 @@ struct Index {
     } catch (error) {
       failures.push(error instanceof Error ? error.message : String(error));
     }
-    if (this.activePairing) {
-      try {
-        await this.activePairing.close();
-      } catch (error) {
-        failures.push(`AirPlay RTSP cleanup: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      this.activePairing = undefined;
-    }
-    this.isSessionActive = false;
     this.controller = undefined;
-    this.airPlayEndpoint = '尚未发现接收端';
-    this.airPlayDetails = '';
-    this.airPlayPairingStatus = '尚未开始 AirPlay 配对';
-    this.airPlayMediaStatus = '尚未建立媒体会话';
-    this.canStartAirPlayMedia = false;
-    this.isStartingAirPlayMedia = false;
     this.audioRtpSession = undefined;
-    this.discoveredAirPlay = undefined;
     if (failures.length > 0) {
       this.showError(new Error(`停止会话时清理失败：${failures.join('；')}`));
     } else {
       this.status = '已停止';
     }
-  }
-
-  private async startAirPlayMediaSession(): Promise<void> {
-    const pairing = this.activePairing;
-    if (!pairing) {
-      this.showError(new Error('请先完成 AirPlay 安全配对'));
-      return;
-    }
-    this.isStartingAirPlayMedia = true;
-    try {
-      const media = await pairing.startCarPlaySession(this.bluetoothAddress, this.deviceName);
-      this.audioRtpSession = media.audioSession;
-      this.airPlayMediaStatus =
-        `RTSP 会话已录制 · 屏幕端口 ${media.videoDataPort} · 音频${media.audioSession ? '可用' : '不可用'}；未发送视频帧`;
-      this.status = 'RTSP 媒体会话已协商；尚无画面输出';
-    } catch (error) {
-      this.airPlayMediaStatus = `媒体会话失败：${error instanceof Error ? error.message : String(error)}`;
-      this.showError(error instanceof Error ? error : new Error(String(error)));
-    } finally {
-      this.isStartingAirPlayMedia = false;
-    }
+    this.isStopping = false;
   }
 
   private async joinWifi(): Promise<void> {
@@ -1356,7 +1391,30 @@ struct Index {
 
   private addLog(message: string): void {
     const timestamp = new Date().toLocaleTimeString();
-    this.logs = [`${timestamp}  ${message}`, ...this.logs].slice(0, 30);
+    const followTail = this.logAtBottom;
+    this.logs = appendConnectionLog(this.logs, `${timestamp}  ${message}`);
+    if (followTail && this.activeTab === 'connect') {
+      setTimeout((): void => {
+        if (this.logAtBottom && this.activeTab === 'connect') {
+          this.scrollLogsToBottom();
+        }
+      }, 40);
+    }
+  }
+
+  private scrollLogsToBottom(): void {
+    if (this.activeTab !== 'connect') {
+      return;
+    }
+    setTimeout((): void => {
+      try {
+        this.logScroller.scrollEdge(Edge.Bottom);
+        this.logAtBottom = true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logs = [...this.logs, `${new Date().toLocaleTimeString()}  日志滚动失败：${message}`].slice(-300);
+      }
+    }, 40);
   }
 
   private showError(error: Error): void {

@@ -1,4 +1,5 @@
 import { describe, it, expect } from '@ohos/hypium';
+import cryptoFramework from '@ohos.security.cryptoFramework';
 import {
   concatBytes,
   decodeIap2Parameters,
@@ -39,11 +40,24 @@ import { AirPlayControlCipher } from '../main/ets/airplay/ControlCipher';
 import { AirPlayMediaSession, selectPcmAudioFormat } from '../main/ets/airplay/AirPlayMediaSession';
 import { buildAirPlayEventResponse, parseAirPlayEventRequests } from '../main/ets/airplay/AirPlayEventChannel';
 import {
+  classifyMfiPkixTrustFailure,
   extractPkcs7CertificateSet,
   isPkcs7SignedDataPayload,
   MfiVerifier,
-  parseMfiCertificateChain
+  parseMfiCertificateChain,
+  verifyMfiChallengeAndPersistPin
 } from '../main/ets/iap2/MfiVerifier';
+import {
+  AirPlayVideoStreamSender,
+  buildAirPlayVideoConfigHeader,
+  buildAirPlayVideoFrameHeader,
+  buildAvcConfigurationRecord,
+  EncodedH264Event,
+  buildVideoFrameNonce,
+  packH264Nals,
+  splitH264NalUnits
+} from '../main/ets/airplay/AirPlayVideoStream';
+import { appendConnectionLog, MAX_CONNECTION_LOG_LINES } from '../main/ets/session/ConnectionLogBuffer';
 
 export default function iap2CodecTest() {
   describe('Iap2Codec', () => {
@@ -59,6 +73,16 @@ export default function iap2CodecTest() {
       const parameters = decodeIap2Parameters(frames[0].body);
       expect(parameters.length).assertEqual(1);
       expect(decodeIap2String(parameters[0].value)).assertEqual('CarDeck');
+    });
+
+    it('keeps a bounded chronological connection log', 0, () => {
+      let lines: string[] = [];
+      for (let index = 0; index < MAX_CONNECTION_LOG_LINES + 2; index++) {
+        lines = appendConnectionLog(lines, `line-${index}`);
+      }
+      expect(lines.length).assertEqual(MAX_CONNECTION_LOG_LINES);
+      expect(lines[0]).assertEqual('line-2');
+      expect(lines[lines.length - 1]).assertEqual(`line-${MAX_CONNECTION_LOG_LINES + 1}`);
     });
 
     it('parses link frames split across chunks and validates checksum', 0, () => {
@@ -144,6 +168,165 @@ export default function iap2CodecTest() {
       expect(extracted.length).assertEqual(1);
       expect(extracted[0].length).assertEqual(certificate.length);
       expect(extracted[0][0]).assertEqual(certificate[0]);
+    });
+
+    it('requires exact fingerprint pinning and only permits issuer-chain failures', 0, () => {
+      const fingerprint = 'a'.repeat(64);
+      expect(classifyMfiPkixTrustFailure(
+        'unable to get local issuer certificate',
+        fingerprint,
+        []
+      )).assertEqual('prompt-for-pin');
+      expect(classifyMfiPkixTrustFailure(
+        'unable to get local issuer certificate',
+        fingerprint,
+        [`${'a'.repeat(63)}b`]
+      )).assertEqual('prompt-for-pin');
+      expect(classifyMfiPkixTrustFailure(
+        'No AIA extension found in certificate',
+        fingerprint,
+        [fingerprint.toUpperCase()]
+      )).assertEqual('already-pinned');
+      expect(classifyMfiPkixTrustFailure(
+        'unhandled critical extension',
+        fingerprint,
+        []
+      )).assertEqual('prompt-for-pin');
+      expect(classifyMfiPkixTrustFailure(
+        'key cannot be used for a digital signature',
+        fingerprint,
+        []
+      )).assertEqual('prompt-for-pin');
+      expect(classifyMfiPkixTrustFailure(
+        'certificate has expired',
+        fingerprint,
+        [fingerprint]
+      )).assertEqual('reject');
+    });
+
+    it('verifies Ed25519 without key-name metadata and saves a pin only after success', 0,
+      async (): Promise<void> => {
+        const generator = cryptoFramework.createAsyKeyGenerator('Ed25519');
+        const pair = await generator.generateKeyPair();
+        const challenge = new Uint8Array([0x10, 0x20, 0x30, 0x40]);
+        const signer = cryptoFramework.createSign('Ed25519');
+        await signer.init(pair.priKey);
+        const challengeBlob: cryptoFramework.DataBlob = { data: challenge };
+        const signature = (await signer.sign(challengeBlob)).data;
+        const invalidSignature = signature.slice();
+        invalidSignature[0] = (invalidSignature[0] ?? 0) ^ 0xff;
+        const savedFingerprints: string[] = [];
+        const persist = async (value: string): Promise<void> => {
+          savedFingerprints.push(value);
+        };
+        const fingerprint = 'b'.repeat(64);
+
+        const rejected = await verifyMfiChallengeAndPersistPin(
+          pair.pubKey,
+          challenge,
+          invalidSignature,
+          fingerprint,
+          persist
+        );
+        expect(rejected.verified).assertFalse();
+        expect(savedFingerprints.length).assertEqual(0);
+
+        const accepted = await verifyMfiChallengeAndPersistPin(
+          pair.pubKey,
+          challenge,
+          signature,
+          fingerprint,
+          persist
+        );
+        expect(accepted.verified).assertTrue();
+        expect(accepted.algorithm).assertEqual('Ed25519');
+        expect(savedFingerprints.length).assertEqual(1);
+        expect(savedFingerprints[0] ?? '').assertEqual(fingerprint);
+      });
+
+    it('splits Annex-B H.264 and packs length-prefixed NAL units', 0, () => {
+      const annexB = new Uint8Array([
+        0, 0, 0, 1, 0x67, 0x64, 0, 0x1f,
+        0, 0, 1, 0x68, 0xee, 0x06
+      ]);
+      const units = splitH264NalUnits(annexB);
+      expect(units.length).assertEqual(2);
+      expect(units[0][0]).assertEqual(0x67);
+      expect(units[1][0]).assertEqual(0x68);
+      const packed = packH264Nals(units);
+      expect(packed.length).assertEqual(15);
+      expect(packed[3]).assertEqual(4);
+      expect(packed[4]).assertEqual(0x67);
+      expect(packed[11]).assertEqual(3);
+      expect(packed[12]).assertEqual(0x68);
+    });
+
+    it('builds AirPlay H.264 config/frame headers and stable little-endian nonces', 0, () => {
+      const sps = new Uint8Array([0x67, 0x64, 0x00, 0x1f, 0xaa]);
+      const pps = new Uint8Array([0x68, 0xee, 0x06]);
+      const config = buildAvcConfigurationRecord([sps, pps]);
+      expect(config[0]).assertEqual(1);
+      expect(config[4]).assertEqual(0xff);
+      const decodedConfig = splitH264NalUnits(config);
+      expect(decodedConfig.length).assertEqual(2);
+      expect(decodedConfig[0][0]).assertEqual(0x67);
+      expect(decodedConfig[1][0]).assertEqual(0x68);
+      const configHeader = buildAirPlayVideoConfigHeader(config.length, 1160, 540);
+      expect(configHeader.length).assertEqual(128);
+      expect(configHeader[4]).assertEqual(1);
+      expect(configHeader[6]).assertEqual(4);
+      const frameHeader = buildAirPlayVideoFrameHeader(99, 0);
+      expect(frameHeader[0]).assertEqual(99);
+      expect(frameHeader[4]).assertEqual(0);
+      expect(frameHeader[6]).assertEqual(4);
+      const nonce = buildVideoFrameNonce(BigInt(0x010203));
+      expect(nonce.length).assertEqual(12);
+      expect(nonce[4]).assertEqual(3);
+      expect(nonce[5]).assertEqual(2);
+      expect(nonce[6]).assertEqual(1);
+    });
+
+    it('serializes config before encrypted H.264 frames', 0, async (): Promise<void> => {
+      const key = new Uint8Array(32);
+      key.fill(0x31);
+      const messages: Uint8Array[] = [];
+      const sender = new AirPlayVideoStreamSender(
+        key,
+        1280,
+        720,
+        async (data: Uint8Array): Promise<void> => {
+          messages.push(data);
+        },
+        (_message: string): void => {}
+      );
+      const codecConfig = new Uint8Array([
+        0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0xaa,
+        0, 0, 1, 0x68, 0xee, 0x06
+      ]);
+      const frame = new Uint8Array([0, 0, 0, 1, 0x65, 0x88]);
+      const configEvent: EncodedH264Event = {
+        type: 'codecConfig',
+        data: codecConfig,
+        timestampUs: 0,
+        flags: 8
+      };
+      const frameEvent: EncodedH264Event = {
+        type: 'frame',
+        data: frame,
+        timestampUs: 33333,
+        flags: 2
+      };
+      await sender.handleEncoderEvent(configEvent);
+      await sender.handleEncoderEvent(frameEvent);
+      expect(messages.length).assertEqual(2);
+      expect(messages[0][4]).assertEqual(1);
+      expect(messages[1][4]).assertEqual(0);
+      expect(messages[1][6]).assertEqual(4);
+      const header = messages[1].slice(0, 128);
+      const decoded = await chachaOpen(key, buildVideoFrameNonce(BigInt(0)), messages[1].slice(128), header);
+      expect(decoded.length).assertEqual(6);
+      expect(decoded[3]).assertEqual(2);
+      expect(decoded[4]).assertEqual(0x65);
     });
 
     it('routes CMS SignedData into the system CMS parser', 0, async (): Promise<void> => {

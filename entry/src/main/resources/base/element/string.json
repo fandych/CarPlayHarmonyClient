@@ -23,6 +23,22 @@
     {
       "name": "permission_bundle_info",
       "value": "用于读取用户手动添加的应用名称及可启动页面"
+    },
+    {
+      "name": "permission_virtual_screen",
+      "value": "用于将用户选择的应用显示到 CarPlay 虚拟屏"
+    },
+    {
+      "name": "permission_input_injection",
+      "value": "用于把车机触摸操作注入到指定 CarPlay 虚拟屏"
+    },
+    {
+      "name": "ProjectionHomeAbility_desc",
+      "value": "CarPlay 虚拟屏启动器"
+    },
+    {
+      "name": "ProjectionHomeAbility_label",
+      "value": "CarPlay"
     }
   ]
 }

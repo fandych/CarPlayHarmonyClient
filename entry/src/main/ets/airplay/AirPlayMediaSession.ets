@@ -4,6 +4,7 @@ import { hkdfSha512 } from './AirPlayCrypto';
 import { AirPlayEventChannel, AirPlayEventRequest } from './AirPlayEventChannel';
 import { AirPlayRtspClient, AirPlayRtspResponse } from './AirPlayRtspClient';
 import { BinaryPlist, PlistNode } from './BinaryPlist';
+import { AirPlayVideoStreamSender, EncodedH264Event } from './AirPlayVideoStream';
 import { encodeUtf8, toArrayBuffer } from '../protocol/Iap2Codec';
 import { AudioRtpSession } from '../audio/AudioRtpSender';
 
@@ -30,6 +31,9 @@ export interface AirPlayMediaSessionInfo {
   keepAlivePort: number;
   enabledFeatures: string[];
   displayUuid: string;
+  displayWidth: number;
+  displayHeight: number;
+  maxFrameRate: number;
   videoDataPort: number;
   videoConnectionId: bigint;
   videoStreamKey: Uint8Array;
@@ -41,6 +45,9 @@ export class AirPlayMediaSession {
   private readonly receiverHost: string;
   private readonly log: (message: string) => void;
   private videoDataSocket?: netSocket.TCPSocket;
+  private videoStreamSender?: AirPlayVideoStreamSender;
+  private videoWriteQueue: Promise<void> = Promise.resolve();
+  private forceKeyFrameHandler?: () => void;
   private videoKeepAliveTimer: number = -1;
   private timingSocket?: netSocket.UDPSocket;
   private timingHandler?: (info: netSocket.SocketMessageInfo) => void;
@@ -79,7 +86,11 @@ export class AirPlayMediaSession {
       );
       const initialResponse = requireDictionary(initialSetup, 'initial session SETUP');
       const enabledFeatures = readStringArray(initialResponse.get('enabledFeatures'));
-      const displayUuid = readDisplayUuid(info);
+      const display = readDisplayInfo(info);
+      const displayUuid = display.uuid;
+      if (display.usedFallbackSize) {
+        this.log('AirPlay /info screen size unavailable; using 1280x720 H.264 fallback');
+      }
       if (!enabledFeatures.includes('videoPlayback')) {
         throw new Error(`Receiver did not enable videoPlayback (${enabledFeatures.join(', ') || 'no features'})`);
       }
@@ -136,6 +147,13 @@ export class AirPlayMediaSession {
         encodeUtf8(`DataStream-Salt${videoConnectionId.toString()}`),
         encodeUtf8('DataStream-Output-Encryption-Key')
       );
+      this.videoStreamSender = new AirPlayVideoStreamSender(
+        videoStreamKey,
+        display.width,
+        display.height,
+        (data: Uint8Array): Promise<void> => this.enqueueVideoBytes(data),
+        this.log
+      );
       let audioSession: AudioRtpSession | undefined = undefined;
       try {
         audioSession = await this.setupAudioStream(info, sharedSecret);
@@ -149,6 +167,9 @@ export class AirPlayMediaSession {
         keepAlivePort: readPort(initialResponse.get('keepAlivePort')),
         enabledFeatures,
         displayUuid,
+        displayWidth: display.width,
+        displayHeight: display.height,
+        maxFrameRate: display.maxFrameRate,
         videoDataPort,
         videoConnectionId,
         videoStreamKey,
@@ -204,6 +225,20 @@ export class AirPlayMediaSession {
       this.videoKeepAliveTimer = -1;
     }
     const failures: string[] = [];
+    const videoStreamSender = this.videoStreamSender;
+    this.videoStreamSender = undefined;
+    if (videoStreamSender) {
+      try {
+        await videoStreamSender.flush();
+      } catch (error) {
+        failures.push(`screen-stream encoder queue: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    try {
+      await this.videoWriteQueue;
+    } catch (error) {
+      failures.push(`screen-stream send queue: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const eventChannel = this.eventChannel;
     this.eventChannel = undefined;
     if (eventChannel) {
@@ -469,8 +504,34 @@ export class AirPlayMediaSession {
       return;
     }
     const header = AirPlayMediaSession.buildVideoKeepAliveFrame(Date.now());
-    const options: netSocket.TCPSendOptions = { data: toArrayBuffer(header) };
-    await socket.send(options);
+    await this.enqueueVideoBytes(header);
+  }
+
+  async pushEncodedVideo(event: EncodedH264Event): Promise<void> {
+    const sender = this.videoStreamSender;
+    if (!sender || !this.running || !this.recorded) {
+      throw new Error('AirPlay screen stream is not ready for encoded frames');
+    }
+    await sender.handleEncoderEvent(event);
+  }
+
+  setForceKeyFrameHandler(handler: (() => void) | undefined): void {
+    this.forceKeyFrameHandler = handler;
+  }
+
+  private enqueueVideoBytes(data: Uint8Array): Promise<void> {
+    const operation = this.videoWriteQueue.then(async (): Promise<void> => {
+      const socket = this.videoDataSocket;
+      if (!socket) {
+        throw new Error('AirPlay screen data socket is closed');
+      }
+      const options: netSocket.TCPSendOptions = { data: toArrayBuffer(data) };
+      await socket.send(options);
+    });
+    this.videoWriteQueue = operation.catch((error: Error): void => {
+      this.log(`AirPlay screen stream send failed: ${error.message}`);
+    });
+    return operation;
   }
 
   private async setupAudioStream(info: PlistNode, sharedSecret: Uint8Array): Promise<AudioRtpSession | undefined> {
@@ -521,6 +582,11 @@ export class AirPlayMediaSession {
         const command = BinaryPlist.decode(request.body);
         if (command.kind === 'dictionary') {
           commandSummary = ` fields=${Array.from(command.dictionaryValue.keys()).join(',')}`;
+          const commandName = command.get('command');
+          if (commandName?.kind === 'string' && commandName.stringValue === 'forceKeyFrame') {
+            this.log('AirPlay receiver requested an immediate H.264 key frame');
+            this.forceKeyFrameHandler?.();
+          }
         }
       } catch (error) {
         commandSummary = ` plistError=${error instanceof Error ? error.message : String(error)}`;
@@ -700,7 +766,15 @@ function readStringArray(node: PlistNode | undefined): string[] {
     .map((item: PlistNode): string => item.stringValue);
 }
 
-function readDisplayUuid(info: PlistNode): string {
+interface AirPlayDisplayDescriptor {
+  uuid: string;
+  width: number;
+  height: number;
+  maxFrameRate: number;
+  usedFallbackSize: boolean;
+}
+
+function readDisplayInfo(info: PlistNode): AirPlayDisplayDescriptor {
   const displays = info.get('displays');
   if (!displays || displays.kind !== 'array' || displays.arrayValue.length === 0) {
     throw new Error('AirPlay /info did not provide a display descriptor; refusing to invent a display UUID');
@@ -713,19 +787,46 @@ function readDisplayUuid(info: PlistNode): string {
   if (!uuid) {
     throw new Error('AirPlay /info display descriptor has no UUID');
   }
+  let normalizedUuid: string;
   if (uuid.kind === 'string' && uuid.stringValue.length > 0) {
-    return uuid.stringValue;
-  }
-  if (uuid.kind === 'integer') {
-    return uuid.integerValue.toString();
-  }
-  if (uuid.kind === 'data' && uuid.dataValue.length === 16) {
+    normalizedUuid = uuid.stringValue;
+  } else if (uuid.kind === 'integer') {
+    normalizedUuid = uuid.integerValue.toString();
+  } else if (uuid.kind === 'data' && uuid.dataValue.length === 16) {
     const hex = Array.from(uuid.dataValue).map((value: number): string =>
       value.toString(16).padStart(2, '0')
     ).join('');
-    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    normalizedUuid =
+      `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  } else {
+    throw new Error('AirPlay /info display UUID has an unsupported type or length');
   }
-  throw new Error('AirPlay /info display UUID has an unsupported type or length');
+  const widthNode = display.get('widthPixels') ?? display.get('width');
+  const heightNode = display.get('heightPixels') ?? display.get('height');
+  const maxFpsNode = display.get('maxFPS');
+  const readPositiveInteger = (node: PlistNode | undefined): number | undefined => {
+    if (!node || node.kind !== 'integer') {
+      return undefined;
+    }
+    const value = Number(node.integerValue);
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  };
+  const rawWidth = readPositiveInteger(widthNode);
+  const rawHeight = readPositiveInteger(heightNode);
+  const frameRate = readPositiveInteger(maxFpsNode);
+  const usedFallbackSize = rawWidth === undefined || rawHeight === undefined;
+  const sourceWidth = rawWidth ?? 1280;
+  const sourceHeight = rawHeight ?? 720;
+  const scale = Math.min(1, 1920 / sourceWidth, 1200 / sourceHeight);
+  const width = Math.max(320, Math.floor((sourceWidth * scale) / 2) * 2);
+  const height = Math.max(240, Math.floor((sourceHeight * scale) / 2) * 2);
+  return {
+    uuid: normalizedUuid,
+    width,
+    height,
+    maxFrameRate: Math.max(15, Math.min(60, frameRate ?? 30)),
+    usedFallbackSize
+  };
 }
 
 function normalizeDeviceId(value: string): string {

@@ -10,6 +10,7 @@ export interface CarDeckAppSettings {
   lastSsid: string;
   keepScreenOn: boolean;
   allowMfiIntermediateDownload: boolean;
+  trustedMfiFingerprints: string[];
   favoriteBundles: string[];
   backgroundPhotoUri: string;
 }
@@ -28,6 +29,7 @@ export class AppSettingsStore {
       const lastSsid = await store.get('lastSsid', '');
       const keepScreenOn = await store.get('keepScreenOn', true);
       const allowMfiIntermediateDownload = await store.get('allowMfiIntermediateDownload', false);
+      const trustedMfiFingerprints = await store.get('trustedMfiFingerprints', '');
       const favorites = await store.get('favoriteBundles', '');
       const backgroundPhotoUri = await store.get('backgroundPhotoUri', '');
 
@@ -41,6 +43,9 @@ export class AppSettingsStore {
         keepScreenOn: typeof keepScreenOn === 'boolean' ? keepScreenOn : true,
         allowMfiIntermediateDownload: typeof allowMfiIntermediateDownload === 'boolean'
           ? allowMfiIntermediateDownload : false,
+        trustedMfiFingerprints: this.decodeMfiFingerprints(
+          typeof trustedMfiFingerprints === 'string' ? trustedMfiFingerprints : ''
+        ),
         favoriteBundles: this.decodeBundleNames(typeof favorites === 'string' ? favorites : ''),
         backgroundPhotoUri: typeof backgroundPhotoUri === 'string' ? backgroundPhotoUri : ''
       };
@@ -62,6 +67,7 @@ export class AppSettingsStore {
       await store.put('lastSsid', settings.lastSsid);
       await store.put('keepScreenOn', settings.keepScreenOn);
       await store.put('allowMfiIntermediateDownload', settings.allowMfiIntermediateDownload);
+      await store.put('trustedMfiFingerprints', settings.trustedMfiFingerprints.join('\n'));
       await store.put('favoriteBundles', settings.favoriteBundles.join('\n'));
       await store.put('backgroundPhotoUri', settings.backgroundPhotoUri);
       await store.flush();
@@ -92,6 +98,17 @@ export class AppSettingsStore {
       const bundleName = item.trim();
       if (bundleName && bundleName.length <= 255 && !bundleName.includes('|')) {
         unique.add(bundleName);
+      }
+    }
+    return Array.from(unique);
+  }
+
+  private decodeMfiFingerprints(serialized: string): string[] {
+    const unique: Set<string> = new Set<string>();
+    for (const item of serialized.split('\n')) {
+      const fingerprint = item.trim().toLowerCase();
+      if (/^[0-9a-f]{64}$/.test(fingerprint)) {
+        unique.add(fingerprint);
       }
     }
     return Array.from(unique);

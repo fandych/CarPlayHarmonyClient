@@ -53,6 +53,28 @@
           ],
           "when": "inuse"
         }
+      },
+      {
+        "name": "ohos.permission.ACCESS_VIRTUAL_SCREEN",
+        "reason": "$string:permission_virtual_screen",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility",
+            "ProjectionHomeAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        "name": "ohos.permission.CONTROL_DEVICE",
+        "reason": "$string:permission_input_injection",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility",
+            "ProjectionHomeAbility"
+          ],
+          "when": "inuse"
+        }
       }
     ],
     "abilities": [
@@ -75,6 +97,17 @@
             ]
           }
         ]
+      },
+      {
+        "name": "ProjectionHomeAbility",
+        "srcEntry": "./ets/entryability/ProjectionHomeAbility.ets",
+        "description": "$string:ProjectionHomeAbility_desc",
+        "label": "$string:ProjectionHomeAbility_label",
+        "icon": "$media:layered_image",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": false,
+        "launchType": "standard"
       }
     ],
     "extensionAbilities": [

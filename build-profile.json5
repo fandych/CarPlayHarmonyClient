@@ -5,20 +5,46 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "C:\\Users\\fandych\\.ohos\\config\\default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.cer",
+          "certpath": "C:/Users/fandych/.ohos/config/default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "00000019C474C0D2E53EDD9A5EBAC45962FA7AF5242E0798529D64C06F66D35233A369C5F12E53DF10",
-          "profile": "C:\\Users\\fandych\\.ohos\\config\\default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.p7b",
+          "keyPassword": "0000001924F7E64D123C0484E5C08C79C13B5703B00E93C500903122EC6C6BCFF7A3C65643DA36CDA6",
+          "profile": "C:/Users/fandych/.ohos/config/default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "C:\\Users\\fandych\\.ohos\\config\\default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.p12",
-          "storePassword": "00000019605F7D9C5321F7ED7DB9D83DFD8E376E7D8DBF80459A4C06F3549CF9C276D1E3FEF864E2C8"
+          "storeFile": "C:/Users/fandych/.ohos/config/default_CarPlayHW_UX6gfjw22qRiP1Fzhhy0-3YuZlHju91vtLibLbr4AD4=.p12",
+          "storePassword": "000000197F7CDC9F1ED12F6E717EB7B07F7C899760CECB265B87140AFDEA02011EC0F3A3E298158871"
+        }
+      },
+      {
+        "name": "localCerts",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:/Users/fandych/DevEcoStudioProjects/CarPlayHW/certs/CarPlayHarmonyClient.cer",
+          "keyAlias": "CarPlayHarmonyClient",
+          "keyPassword": "00000024853E85C48CCA0A17408E911786096B6160FE5EDBB2144B8F2E33F704176C670CAB6E0867281AA3F65B270597079CEF1F",
+          "profile": "C:/Users/fandych/DevEcoStudioProjects/CarPlayHW/certs/debugDebug.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:/Users/fandych/DevEcoStudioProjects/CarPlayHW/certs/CarPlayHarmonyClient.p12",
+          "storePassword": "0000002494359DAB0143263C61D883FF0D7FDDDC8906DD019A5DF1DC897F2FCEB0EDFA8E19826CD2FD56EEF3AD8E15F22F4973F5"
         }
       }
     ],
     "products": [
       {
         "name": "default",
-        "signingConfig": "default",
+        "signingConfig": "localCerts",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "26.0.0",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      },
+      {
+        "name": "privileged",
+        "signingConfig": "localCerts",
         "targetSdkVersion": "26.0.0",
         "compatibleSdkVersion": "26.0.0",
         "runtimeOS": "HarmonyOS",
@@ -32,10 +58,21 @@
     ],
     "buildModeSet": [
       {
-        "name": "debug",
+        "name": "debug"
       },
       {
         "name": "release"
+      }
+    ],
+    "capabilities": [
+      {
+        "bundleName": "com.fandy.carplayhw",
+        "config": [
+          {
+            "name": "Bluetooth scan information retrieval",
+            "capability": "com.huawei.service.bluetooth"
+          }
+        ]
       }
     ]
   },
@@ -47,7 +84,8 @@
         {
           "name": "default",
           "applyToProducts": [
-            "default"
+            "default",
+            "privileged"
           ]
         }
       ]

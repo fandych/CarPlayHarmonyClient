@@ -12,6 +12,7 @@ import {
 } from './AirPlayCrypto';
 import { AirPlayControllerIdentity, AirPlayIdentityStore } from './AirPlayIdentityStore';
 import { AirPlayMediaSession, AirPlayMediaSessionInfo } from './AirPlayMediaSession';
+import { EncodedH264Event } from './AirPlayVideoStream';
 import { AirPlayRtspClient, AirPlayRtspResponse } from './AirPlayRtspClient';
 import { PlistNode } from './BinaryPlist';
 import { Srp6aSession } from './Srp6aClient';
@@ -163,6 +164,18 @@ export class AirPlayPairingClient {
       this.mediaSession = undefined;
       throw error instanceof Error ? error : new Error(String(error));
     }
+  }
+
+  async pushEncodedVideo(event: EncodedH264Event): Promise<void> {
+    const mediaSession = this.mediaSession;
+    if (!mediaSession) {
+      throw new Error('AirPlay media session is not active');
+    }
+    await mediaSession.pushEncodedVideo(event);
+  }
+
+  setForceKeyFrameHandler(handler: (() => void) | undefined): void {
+    this.mediaSession?.setForceKeyFrameHandler(handler);
   }
 
   async close(): Promise<void> {

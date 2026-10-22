@@ -1,6 +1,6 @@
 import cert from '@ohos.security.cert';
 import cryptoFramework from '@ohos.security.cryptoFramework';
-import { encodeUtf8 } from '../protocol/Iap2Codec';
+import { decodeUtf8, encodeUtf8 } from '../protocol/Iap2Codec';
 
 const MAX_CERTIFICATE_BYTES: number = 1024 * 1024;
 const MAX_CHAIN_CERTIFICATES: number = 8;
@@ -16,8 +16,21 @@ export interface MfiCertificateChain {
   encodingName: string;
 }
 
+export interface MfiTrustCandidate {
+  certificate: cert.X509Cert;
+  trustSource: 'system-pkix' | 'user-pinned';
+  fingerprintToPersist: string;
+}
+
+export interface MfiTrustPromptInfo {
+  fingerprint: string;
+  subject: string;
+  issuer: string;
+  pkixFailure: string;
+}
+
 export interface ValidatedMfiCertificate {
-  certificates: cert.X509Cert[];
+  candidates: MfiTrustCandidate[];
   certificateCount: number;
   encodingName: string;
 }
@@ -132,13 +145,96 @@ export function parseMfiCertificateChain(input: Uint8Array): MfiCertificateChain
   return parseDerCertificateChain(input);
 }
 
+export type MfiPkixTrustDecision = 'prompt-for-pin' | 'already-pinned' | 'reject';
+
+export function classifyMfiPkixTrustFailure(
+  message: string,
+  fingerprint: string,
+  pinnedFingerprints: string[]
+): MfiPkixTrustDecision {
+  if (!isMfiPinEligiblePkixFailure(message)) {
+    return 'reject';
+  }
+  const normalized = fingerprint.toLowerCase();
+  return pinnedFingerprints.some((pin: string): boolean => pin.toLowerCase() === normalized)
+    ? 'already-pinned'
+    : 'prompt-for-pin';
+}
+
+export interface MfiSignatureVerificationResult {
+  verified: boolean;
+  algorithm: string;
+  errors: string[];
+}
+
+const MFI_CHALLENGE_SIGNATURE_ALGORITHMS: string[] = [
+  'RSA|PKCS1|SHA256',
+  'RSA|PKCS1|SHA1',
+  'ECC|SHA256',
+  'ECC|SHA1',
+  'Ed25519'
+];
+
+export async function verifyMfiChallengeSignature(
+  publicKey: cryptoFramework.PubKey,
+  challenge: Uint8Array,
+  signature: Uint8Array
+): Promise<MfiSignatureVerificationResult> {
+  const inputBlob: cryptoFramework.DataBlob = { data: challenge };
+  const signatureBlob: cryptoFramework.DataBlob = { data: signature };
+  const errors: string[] = [];
+  for (const algorithm of MFI_CHALLENGE_SIGNATURE_ALGORITHMS) {
+    try {
+      const verifier = cryptoFramework.createVerify(algorithm);
+      await verifier.init(publicKey);
+      if (await verifier.verify(inputBlob, signatureBlob)) {
+        return { verified: true, algorithm, errors };
+      }
+      errors.push(`${algorithm}: signature mismatch`);
+    } catch (error) {
+      errors.push(`${algorithm}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return { verified: false, algorithm: '', errors };
+}
+
+export async function verifyMfiChallengeAndPersistPin(
+  publicKey: cryptoFramework.PubKey,
+  challenge: Uint8Array,
+  signature: Uint8Array,
+  fingerprintToPersist: string,
+  persistFingerprint?: (fingerprint: string) => Promise<void>
+): Promise<MfiSignatureVerificationResult> {
+  const result = await verifyMfiChallengeSignature(publicKey, challenge, signature);
+  if (!result.verified || fingerprintToPersist.length === 0) {
+    return result;
+  }
+  if (!persistFingerprint) {
+    throw new Error('MFi pin persistence callback is unavailable; refusing authentication success');
+  }
+  await persistFingerprint(fingerprintToPersist);
+  return result;
+}
+
 export class MfiVerifier {
   private readonly log: (message: string) => void;
   private readonly allowIntermediateDownload: boolean;
+  private readonly pinnedFingerprints: string[];
+  private readonly requestTrust?: (info: MfiTrustPromptInfo) => Promise<boolean>;
+  private readonly persistFingerprint?: (fingerprint: string) => Promise<void>;
 
-  constructor(log: (message: string) => void, allowIntermediateDownload: boolean = false) {
+  constructor(
+    log: (message: string) => void,
+    allowIntermediateDownload: boolean = false,
+    pinnedFingerprints: string[] = [],
+    requestTrust?: (info: MfiTrustPromptInfo) => Promise<boolean>,
+    persistFingerprint?: (fingerprint: string) => Promise<void>
+  ) {
     this.log = log;
     this.allowIntermediateDownload = allowIntermediateDownload;
+    this.pinnedFingerprints = pinnedFingerprints.map((value: string): string => value.toLowerCase());
+    this.requestTrust = requestTrust;
+    this.persistFingerprint = persistFingerprint;
   }
 
   async validateAccessoryCertificate(certificatePayload: Uint8Array): Promise<ValidatedMfiCertificate> {
@@ -311,23 +407,68 @@ export class MfiVerifier {
       `MFi PKIX uses system CA; AIA intermediate download ${this.allowIntermediateDownload ? 'enabled' : 'disabled'}`
     );
     const validator = cert.createCertChainValidator('PKIX');
-    const trustedCertificates: cert.X509Cert[] = [];
+    const trustedCandidates: MfiTrustCandidate[] = [];
     const validationErrors: string[] = [];
     for (let index = 0; index < candidateCertificates.length; index++) {
       const item = candidateCertificates[index];
       if (!item) {
         continue;
       }
+      this.log(`MFi PKIX candidate ${index}: ${certificateNames(item)}`);
       try {
         await validator.validateCert(item, validationParams);
-        trustedCertificates.push(item);
+        trustedCandidates.push({
+          certificate: item,
+          trustSource: 'system-pkix',
+          fingerprintToPersist: ''
+        });
       } catch (error) {
-        validationErrors.push(
-          `candidate ${index}: ${error instanceof Error ? error.message : String(error)}`
+        const pkixFailure = error instanceof Error ? error.message : String(error);
+        if (!isMfiPinEligiblePkixFailure(pkixFailure)) {
+          validationErrors.push(formatPkixFailure(index, pkixFailure, this.allowIntermediateDownload));
+          continue;
+        }
+        const fingerprint = await x509Fingerprint(item);
+        const trustDecision = classifyMfiPkixTrustFailure(
+          pkixFailure,
+          fingerprint,
+          this.pinnedFingerprints
         );
+        if (trustDecision === 'already-pinned') {
+          this.validateUserPinnedCertificateValidity(item, validationTime);
+          trustedCandidates.push({
+            certificate: item,
+            trustSource: 'user-pinned',
+            fingerprintToPersist: ''
+          });
+          this.log(`MFi certificate accepted by exact user-pinned SHA-256 fingerprint ${fingerprint}`);
+          continue;
+        }
+        const prompt = this.requestTrust;
+        if (!prompt) {
+          validationErrors.push(formatPkixFailure(index, pkixFailure, this.allowIntermediateDownload));
+          continue;
+        }
+        const identity = certificateIdentity(item);
+        const approved = await prompt({
+          fingerprint,
+          subject: identity.subject,
+          issuer: identity.issuer,
+          pkixFailure: formatPkixFailure(index, pkixFailure, this.allowIntermediateDownload)
+        });
+        if (!approved) {
+          throw new Error(`MFi certificate trust declined for SHA-256 ${fingerprint}`);
+        }
+        this.validateUserPinnedCertificateValidity(item, validationTime);
+        trustedCandidates.push({
+          certificate: item,
+          trustSource: 'user-pinned',
+          fingerprintToPersist: fingerprint
+        });
+        this.log(`User approved first-use MFi fingerprint ${fingerprint}; challenge signature still required`);
       }
     }
-    if (trustedCertificates.length === 0) {
+    if (trustedCandidates.length === 0) {
       throw new Error(
         `MFi PKIX validation failed against the system CA (${untrustedCertificates.length} certificate(s), ` +
           `date=${validationTime}, AIA download=${this.allowIntermediateDownload})` +
@@ -337,10 +478,21 @@ export class MfiVerifier {
     }
 
     return {
-      certificates: trustedCertificates,
+      candidates: trustedCandidates,
       certificateCount: untrustedCertificates.length,
       encodingName
     };
+  }
+
+  private validateUserPinnedCertificateValidity(certificate: cert.X509Cert, validationTime: string): void {
+    try {
+      certificate.checkValidityWithDate(validationTime);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `User-pinned MFi leaf failed certificate validity-date check; not saved or accepted: ${message}`
+      );
+    }
   }
 
   async verifyChallenge(validated: ValidatedMfiCertificate, challenge: Uint8Array, signature: Uint8Array):
@@ -348,45 +500,40 @@ export class MfiVerifier {
     if (challenge.length === 0 || signature.length === 0) {
       throw new Error('MFi challenge and signature are required');
     }
-    const inputBlob: cryptoFramework.DataBlob = { data: challenge };
-    const signatureBlob: cryptoFramework.DataBlob = { data: signature };
     const errors: string[] = [];
-    for (let index = 0; index < validated.certificates.length; index++) {
-      const certificate = validated.certificates[index];
-      if (!certificate) {
+    for (let index = 0; index < validated.candidates.length; index++) {
+      const candidate = validated.candidates[index];
+      if (!candidate) {
         continue;
       }
+      const certificate = candidate.certificate;
       const publicKey = certificate.getPublicKey();
-      const keyAlgorithm = publicKey.algName.toUpperCase();
-      let candidates: string[];
-      if (keyAlgorithm.includes('RSA')) {
-        candidates = ['RSA|PKCS1|SHA256', 'RSA|PKCS1|SHA1'];
-      } else if (keyAlgorithm.includes('ED25519')) {
-        candidates = ['Ed25519'];
-      } else if (keyAlgorithm.includes('EC') || keyAlgorithm.includes('ECDSA') || keyAlgorithm.includes('ECC')) {
-        candidates = ['ECC|SHA256', 'ECC|SHA1'];
-      } else {
-        errors.push(`certificate ${index}: unsupported key type ${publicKey.algName}`);
+      const verification = await verifyMfiChallengeAndPersistPin(
+        publicKey,
+        challenge,
+        signature,
+        candidate.fingerprintToPersist,
+        this.persistFingerprint
+      );
+      if (!verification.verified) {
+        errors.push(
+          `certificate ${index}: no supported challenge signature verified` +
+            `${verification.errors.length > 0 ? ` [${verification.errors.join('; ')}]` : ''}`
+        );
         continue;
       }
-      for (const algorithm of candidates) {
-        try {
-          const verifier = cryptoFramework.createVerify(algorithm);
-          await verifier.init(publicKey);
-          if (await verifier.verify(inputBlob, signatureBlob)) {
-            this.log(
-              `MFi ${validated.encodingName} chain (${validated.certificateCount} certificate(s)) trusted; ` +
-                `challenge verified using ${algorithm}`
-            );
-            return;
-          }
-        } catch (error) {
-          errors.push(`${algorithm}: ${error instanceof Error ? error.message : String(error)}`);
-        }
+      if (candidate.fingerprintToPersist.length > 0) {
+        this.log('MFi fingerprint pinned after successful challenge signature');
       }
+      this.log(
+        `MFi ${validated.encodingName} ${candidate.trustSource} ` +
+          `(${validated.certificateCount} certificate(s)); ` +
+          `challenge verified using ${verification.algorithm}`
+      );
+      return;
     }
     throw new Error(
-      `MFi challenge signature verification failed against ${validated.certificates.length} trusted candidate(s)` +
+      `MFi challenge signature verification failed against ${validated.candidates.length} trusted candidate(s)` +
         `${errors.length > 0 ? ` (${errors.join('; ')})` : ''}`
     );
   }
@@ -449,6 +596,62 @@ function isSignedDataOid(input: Uint8Array, oid: DerTlv): boolean {
     }
   }
   return true;
+}
+
+interface MfiCertificateIdentity {
+  subject: string;
+  issuer: string;
+}
+
+function certificateIdentity(certificate: cert.X509Cert): MfiCertificateIdentity {
+  try {
+    const subjectBlob = certificate.getSubjectName(cert.EncodingType.ENCODING_UTF8);
+    const subject = decodeUtf8(new Uint8Array(subjectBlob.data)).replace(/\0/g, '').slice(0, 240);
+    const issuer = certificate.getIssuerName(cert.EncodingType.ENCODING_UTF8).slice(0, 240);
+    return { subject, issuer };
+  } catch (error) {
+    const failure = error instanceof Error ? error.message : String(error);
+    return { subject: `unavailable (${failure})`, issuer: 'unavailable' };
+  }
+}
+
+function certificateNames(certificate: cert.X509Cert): string {
+  const identity = certificateIdentity(certificate);
+  return `subject=${identity.subject}; issuer=${identity.issuer}`;
+}
+
+export function isMfiPinEligiblePkixFailure(message: string): boolean {
+  return message.includes('unable to get local issuer certificate') ||
+    message.includes('No AIA extension found in certificate') ||
+    message.includes('Failed to obtain the certificate issuer') ||
+    message.includes('19030005') ||
+    message.includes('19030009') ||
+    message.includes('19030007') ||
+    message.includes('19030011') ||
+    message.toLowerCase().includes('untrusted certificate') ||
+    message.toLowerCase().includes('key cannot be used for a digital signature') ||
+    message.toLowerCase().includes('unsupported critical extension') ||
+    message.toLowerCase().includes('unhandled critical extension');
+}
+
+async function x509Fingerprint(certificate: cert.X509Cert): Promise<string> {
+  const encoded = await certificate.getEncoded();
+  if (encoded.encodingFormat !== cert.EncodingFormat.FORMAT_DER) {
+    throw new Error(`X.509 getEncoded returned unsupported format ${encoded.encodingFormat}`);
+  }
+  return sha256Fingerprint(encoded.data);
+}
+
+function formatPkixFailure(index: number, error: Error | string, aiaEnabled: boolean): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('No AIA extension found in certificate') ||
+    message.includes('unable to get local issuer certificate')) {
+    return `candidate ${index}: issuer chain is incomplete; the leaf has no usable AIA issuer URL ` +
+      `(${aiaEnabled ? 'AIA lookup enabled but no URL was present' : 'AIA lookup disabled'}). ` +
+      'Supply the authentic Apple Accessories intermediate certificate; the system CA must still trust its root. ' +
+      `System detail: ${message}`;
+  }
+  return `candidate ${index}: ${message}`;
 }
 
 function parseDerCertificateChain(input: Uint8Array): MfiCertificateChain {

@@ -7,6 +7,9 @@ export interface WifiConnectionResult {
 }
 
 export class WifiCarPlayConnector {
+  private pendingNetworkId: number = -1;
+  private requestGeneration: number = 0;
+
   async connect(credentials: WifiCredentials): Promise<WifiConnectionResult> {
     if (credentials.ssid.length === 0 || credentials.ssid.length > 32) {
       throw new Error('车机 Wi-Fi 名称无效');
@@ -27,16 +30,30 @@ export class WifiCarPlayConnector {
     if (networkId < 0) {
       throw new Error('系统没有接受车机 Wi-Fi 配置');
     }
+    const generation = ++this.requestGeneration;
+    this.pendingNetworkId = networkId;
     try {
       await wifiManager.connectToCandidateConfigWithUserAction(networkId);
+      if (generation !== this.requestGeneration) {
+        throw new Error('CarPlay 连接已取消');
+      }
       const deadline = Date.now() + 20000;
       while (Date.now() < deadline) {
+        if (generation !== this.requestGeneration) {
+          throw new Error('CarPlay 连接已取消');
+        }
         const linked = await wifiManager.getLinkedInfo();
+        if (generation !== this.requestGeneration) {
+          throw new Error('CarPlay 连接已取消');
+        }
         if (linked.ssid === credentials.ssid && linked.ipAddress !== 0) {
           const result: WifiConnectionResult = {
             ssid: credentials.ssid,
             ipAddress: this.formatIpAddress(linked.ipAddress)
           };
+          if (this.pendingNetworkId === networkId && generation === this.requestGeneration) {
+            this.pendingNetworkId = -1;
+          }
           return result;
         }
         await new Promise<void>((resolve: () => void): void => {
@@ -48,13 +65,30 @@ export class WifiCarPlayConnector {
       throw new Error(`20 秒内未确认加入车机热点；当前网络为 ${actualSsid}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      try {
-        await wifiManager.removeCandidateConfig(networkId);
-      } catch (cleanupError) {
-        const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-        throw new Error(`${message}；清理 Wi-Fi 配置失败：${cleanupMessage}`);
+      if (this.pendingNetworkId === networkId && generation === this.requestGeneration) {
+        this.pendingNetworkId = -1;
+        try {
+          await wifiManager.removeCandidateConfig(networkId);
+        } catch (cleanupError) {
+          const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          throw new Error(`${message}；清理 Wi-Fi 配置失败：${cleanupMessage}`);
+        }
       }
       throw new Error(message);
+    }
+  }
+
+  async cancelPendingJoin(): Promise<void> {
+    this.requestGeneration++;
+    const networkId = this.pendingNetworkId;
+    this.pendingNetworkId = -1;
+    if (networkId < 0) {
+      return;
+    }
+    try {
+      await wifiManager.removeCandidateConfig(networkId);
+    } catch (error) {
+      throw new Error(`取消车机 Wi-Fi 加入失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
