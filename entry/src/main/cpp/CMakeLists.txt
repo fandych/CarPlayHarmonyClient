@@ -7,4 +7,6 @@ target_link_libraries(entry PUBLIC
   libace_napi.z.so
   libnative_avscreen_capture.so
   libnative_media_core.so
+  libnative_image.so
+  libnative_window.so
 )

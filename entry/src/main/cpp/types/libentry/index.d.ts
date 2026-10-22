@@ -27,6 +27,8 @@ export interface NativeScreenCapture {
   startCapture(width: number, height: number, displayId: number,
     callback: (event: ScreenCaptureEvent) => void): void;
   stopCapture(): void;
+  createVirtualSurface(width: number, height: number): string;
+  destroyVirtualSurface(): void;
 }
 
 declare const nativeScreenCapture: NativeScreenCapture;

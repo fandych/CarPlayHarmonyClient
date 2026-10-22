@@ -1,5 +1,6 @@
 #include <atomic>
 #include <algorithm>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -7,11 +8,15 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <napi/native_api.h>
 #include <multimedia/player_framework/native_avbuffer.h>
 #include <multimedia/player_framework/native_avscreen_capture.h>
+#include <native_image/native_image.h>
+#include <native_image/graphic_error_code.h>
+#include <native_window/external_window.h>
 
 namespace {
 
@@ -44,12 +49,203 @@ struct CaptureState {
     int32_t height = 0;
 };
 
+struct VirtualSurfaceState {
+    OH_NativeImage *consumer = nullptr;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::thread worker;
+    bool frameAvailable = false;
+    std::atomic<bool> stopping{false};
+    std::atomic<int32_t> error{0};
+};
+
 std::mutex g_stateMutex;
 CaptureState *g_state = nullptr;
+std::mutex g_virtualSurfaceMutex;
+VirtualSurfaceState *g_virtualSurface = nullptr;
 constexpr int32_t MAX_ENCODED_BUFFER_BYTES = 4 * 1024 * 1024;
 constexpr uint32_t MAX_QUEUED_VIDEO_BUFFERS = 8;
 
 void EmitEvent(CaptureState *state, CaptureEvent *event);
+
+void OnVirtualSurfaceFrame(void *context)
+{
+    auto *state = static_cast<VirtualSurfaceState *>(context);
+    if (state == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->stopping.load()) {
+            return;
+        }
+        state->frameAvailable = true;
+    }
+    state->condition.notify_one();
+}
+
+void ConsumeVirtualSurfaceFrames(VirtualSurfaceState *state)
+{
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->condition.wait(lock, [state]() {
+                return state->stopping.load() || state->frameAvailable;
+            });
+            if (state->stopping.load()) {
+                return;
+            }
+            state->frameAvailable = false;
+        }
+
+        for (uint32_t i = 0; i < 8 && !state->stopping.load(); ++i) {
+            OHNativeWindowBuffer *buffer = nullptr;
+            int fenceFd = -1;
+            const int32_t acquireResult = OH_NativeImage_AcquireNativeWindowBuffer(
+                state->consumer, &buffer, &fenceFd);
+            if (acquireResult != 0 || buffer == nullptr) {
+                if (acquireResult != NATIVE_ERROR_NO_BUFFER) {
+                    state->error.store(acquireResult == 0 ? -1 : acquireResult);
+                }
+                break;
+            }
+            const int32_t referenceResult = OH_NativeWindow_NativeObjectReference(buffer);
+            const int32_t releaseResult = OH_NativeImage_ReleaseNativeWindowBuffer(
+                state->consumer, buffer, fenceFd);
+            const int32_t unreferenceResult = referenceResult == 0 ?
+                OH_NativeWindow_NativeObjectUnreference(buffer) : 0;
+            if (referenceResult != 0 || releaseResult != 0 || unreferenceResult != 0) {
+                state->error.store(referenceResult != 0 ? referenceResult :
+                    (releaseResult != 0 ? releaseResult : unreferenceResult));
+                break;
+            }
+        }
+    }
+}
+
+napi_value CreateVirtualSurface(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc != 2) {
+        napi_throw_type_error(env, nullptr, "createVirtualSurface requires width and height.");
+        return nullptr;
+    }
+    napi_valuetype widthType;
+    napi_valuetype heightType;
+    int32_t width = 0;
+    int32_t height = 0;
+    if (napi_typeof(env, args[0], &widthType) != napi_ok || widthType != napi_number ||
+        napi_typeof(env, args[1], &heightType) != napi_ok || heightType != napi_number ||
+        napi_get_value_int32(env, args[0], &width) != napi_ok ||
+        napi_get_value_int32(env, args[1], &height) != napi_ok ||
+        width < 2 || height < 2 || width > 4096 || height > 4096) {
+        napi_throw_range_error(env, nullptr, "Virtual surface dimensions must be between 2 and 4096.");
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> globalLock(g_virtualSurfaceMutex);
+    if (g_virtualSurface != nullptr) {
+        napi_throw_error(env, nullptr, "A virtual display surface is already active.");
+        return nullptr;
+    }
+    auto *state = new (std::nothrow) VirtualSurfaceState();
+    if (state == nullptr) {
+        napi_throw_error(env, nullptr, "Unable to allocate the virtual display surface state.");
+        return nullptr;
+    }
+    state->consumer = OH_ConsumerSurface_Create();
+    if (state->consumer == nullptr) {
+        delete state;
+        napi_throw_error(env, nullptr, "Unable to create the virtual display consumer surface.");
+        return nullptr;
+    }
+
+    uint64_t surfaceId = 0;
+    const OH_OnFrameAvailableListener listener{state, OnVirtualSurfaceFrame};
+    int32_t setupResult = OH_ConsumerSurface_SetDefaultSize(state->consumer, width, height);
+    if (setupResult == 0) {
+        setupResult = OH_NativeImage_GetSurfaceId(state->consumer, &surfaceId);
+    }
+    if (setupResult == 0 && surfaceId != 0) {
+        try {
+            state->worker = std::thread(ConsumeVirtualSurfaceFrames, state);
+        } catch (const std::exception &) {
+            setupResult = -1;
+        }
+    }
+    if (setupResult == 0 && surfaceId != 0) {
+        setupResult = OH_NativeImage_SetOnFrameAvailableListener(state->consumer, listener);
+    }
+    if (setupResult != 0 || surfaceId == 0) {
+        state->stopping.store(true);
+        state->condition.notify_all();
+        if (state->worker.joinable()) {
+            state->worker.join();
+        }
+        OH_NativeImage_UnsetOnFrameAvailableListener(state->consumer);
+        OH_NativeImage_Destroy(&state->consumer);
+        delete state;
+        napi_throw_error(env, nullptr, "Unable to initialize the virtual display consumer surface.");
+        return nullptr;
+    }
+
+    const std::string surfaceIdString = std::to_string(surfaceId);
+    napi_value result = nullptr;
+    if (napi_create_string_utf8(env, surfaceIdString.c_str(), surfaceIdString.length(), &result) != napi_ok) {
+        state->stopping.store(true);
+        state->condition.notify_all();
+        if (state->worker.joinable()) {
+            state->worker.join();
+        }
+        OH_NativeImage_UnsetOnFrameAvailableListener(state->consumer);
+        OH_NativeImage_Destroy(&state->consumer);
+        delete state;
+        napi_throw_error(env, nullptr, "Unable to return the virtual display surface ID.");
+        return nullptr;
+    }
+    g_virtualSurface = state;
+    return result;
+}
+
+napi_value DestroyVirtualSurface(napi_env env, napi_callback_info)
+{
+    VirtualSurfaceState *state = nullptr;
+    {
+        std::lock_guard<std::mutex> globalLock(g_virtualSurfaceMutex);
+        state = g_virtualSurface;
+        g_virtualSurface = nullptr;
+        if (state != nullptr) {
+            state->stopping.store(true);
+        }
+    }
+    if (state == nullptr) {
+        napi_value undefinedValue = nullptr;
+        napi_get_undefined(env, &undefinedValue);
+        return undefinedValue;
+    }
+
+    state->stopping.store(true);
+    state->condition.notify_all();
+    if (state->worker.joinable()) {
+        state->worker.join();
+    }
+    int32_t result = OH_NativeImage_UnsetOnFrameAvailableListener(state->consumer);
+    {
+        if (state->error.load() != 0 && result == 0) {
+            result = state->error.load();
+        }
+        OH_NativeImage_Destroy(&state->consumer);
+    }
+    delete state;
+    if (result != 0) {
+        napi_throw_error(env, nullptr, "Virtual display surface cleanup or frame consumption failed.");
+        return nullptr;
+    }
+    napi_value undefinedValue = nullptr;
+    napi_get_undefined(env, &undefinedValue);
+    return undefinedValue;
+}
 
 void EmitCaptureError(CaptureState *state, int32_t code)
 {
@@ -454,10 +650,18 @@ napi_value Initialize(napi_env env, napi_value exports)
 {
     napi_value start = nullptr;
     napi_value stop = nullptr;
+    napi_value createSurface = nullptr;
+    napi_value destroySurface = nullptr;
     if (napi_create_function(env, "startCapture", NAPI_AUTO_LENGTH, StartCapture, nullptr, &start) != napi_ok ||
         napi_create_function(env, "stopCapture", NAPI_AUTO_LENGTH, StopCapture, nullptr, &stop) != napi_ok ||
+        napi_create_function(env, "createVirtualSurface", NAPI_AUTO_LENGTH,
+            CreateVirtualSurface, nullptr, &createSurface) != napi_ok ||
+        napi_create_function(env, "destroyVirtualSurface", NAPI_AUTO_LENGTH,
+            DestroyVirtualSurface, nullptr, &destroySurface) != napi_ok ||
         napi_set_named_property(env, exports, "startCapture", start) != napi_ok ||
-        napi_set_named_property(env, exports, "stopCapture", stop) != napi_ok) {
+        napi_set_named_property(env, exports, "stopCapture", stop) != napi_ok ||
+        napi_set_named_property(env, exports, "createVirtualSurface", createSurface) != napi_ok ||
+        napi_set_named_property(env, exports, "destroyVirtualSurface", destroySurface) != napi_ok) {
         return ThrowError(env, "Unable to initialize the CarPlay screen capture module.");
     }
     return exports;

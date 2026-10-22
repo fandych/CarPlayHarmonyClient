@@ -2,6 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import display from '@ohos.display';
 import { window } from '@kit.ArkUI';
+import nativeScreenCapture from 'libentry.so';
 import { describeFailure } from '../diagnostics/DiagnosticFormat';
 
 const PROJECTION_WIDTH = 1280;
@@ -25,10 +26,13 @@ export class HarmonyVirtualDisplay {
     context: common.UIAbilityContext,
     log: (message: string, error?: boolean) => void
   ): Promise<HarmonyVirtualDisplay> {
-    const surfaceId = `CarPlayerProjection-${util.generateRandomUUID()}`;
     let screenId: number | undefined = undefined;
     let projectionWindow: window.Window | undefined = undefined;
+    let surfaceCreated = false;
     try {
+      const surfaceId: string =
+        nativeScreenCapture.createVirtualSurface(PROJECTION_WIDTH, PROJECTION_HEIGHT);
+      surfaceCreated = true;
       screenId = await display.createVirtualScreen({
         name: `CarPlayer-${util.generateRandomUUID()}`,
         width: PROJECTION_WIDTH,
@@ -69,6 +73,13 @@ export class HarmonyVirtualDisplay {
           log(`虚拟屏初始化失败后销毁显示器也失败：${describeFailure(cleanupError)}`, true);
         }
       }
+      if (surfaceCreated) {
+        try {
+          nativeScreenCapture.destroyVirtualSurface();
+        } catch (cleanupError) {
+          log(`虚拟屏初始化失败后销毁输出 Surface 也失败：${describeFailure(cleanupError)}`, true);
+        }
+      }
       log(`CarPlayer 虚拟显示初始化失败：${describeFailure(failure)}`, true);
       throw failure;
     }
@@ -89,6 +100,11 @@ export class HarmonyVirtualDisplay {
       await display.destroyVirtualScreen(this.screenId);
     } catch (error) {
       failures.push(`销毁虚拟显示失败：${describeFailure(error)}`);
+    }
+    try {
+      nativeScreenCapture.destroyVirtualSurface();
+    } catch (error) {
+      failures.push(`销毁虚拟显示输出 Surface 失败：${describeFailure(error)}`);
     }
     if (failures.length > 0) {
       throw new Error(failures.join('；'));

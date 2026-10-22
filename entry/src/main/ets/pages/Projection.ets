@@ -50,8 +50,8 @@ struct Projection {
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
         Row({ space: 16 }) {
-          this.statusCard('导航', '等待 CarPlay 导航应用')
-          this.statusCard('音频', '等待 CarPlay 音频应用')
+          this.statusCard('导航', 'CarPlay 导航应用尚未接入')
+          this.statusCard('媒体', 'CarPlay 媒体应用尚未接入')
           this.statusCard('连接', this.deviceName.length > 0 ? '无线连接' : '待机')
         }
         .width('100%')
