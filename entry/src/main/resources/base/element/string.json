@@ -27,10 +27,6 @@
     {
       "name": "virtual_screen_permission_reason",
       "value": "用于创建仅承载 CarPlayer 投屏界面的虚拟显示，不采集手机物理屏幕。"
-    },
-    {
-      "name": "projection_window_permission_reason",
-      "value": "用于在 CarPlayer 虚拟显示上显示应用投屏界面。"
     }
   ]
 }

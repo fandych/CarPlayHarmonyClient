@@ -29,11 +29,11 @@
 - 已加入严格 TLV8 编解码，包含 255 字节分片合并、重复字段分隔和截断输入拒绝，并接入 pair-setup/pair-verify 状态机。SRP、TLV 和配对目前只有协议/构建测试，HUKS 运行行为与真实接收端密钥编码仍需真机验证。
 - 新增 `_carplay-ctrl._tcp` mDNS/TCP 邀请服务与 `/ctrl-int/1/connect` HTTP 请求处理；TXT `id` 只接受合法的蓝牙地址。`ConfiguredBluetoothIdentityProvider` 优先调用带权限检查的系统 provider，无法读取时才使用用户保存的本人手机真实地址；拒绝零值、占位值和会话中途身份变化。手动来源会明确记录，不能宣称普通应用已自动核验地址所有权。
 - 车机 Wi-Fi 绑定不再直接使用 `getDefaultNet()`：等待目标 SSID 关联、唯一 WLAN 句柄和接口地址，绑定后再次核验；多 WLAN 无法唯一确认时拒绝猜测。停止时等待在途操作结束，分别清理候选配置、恢复原应用网络绑定并报告错误。
-- 新增媒体 wire codec：H.264 Annex-B/长度前缀 NAL 归一化、avcC 配置、128 字节屏幕流配置/帧/keepalive 封装、帧 ChaCha AAD/nonce，以及大端 PCM RTP/ChaCha 封包；有协议单测。视频流密钥按 `DataStream-Salt<streamConnectionID>` / `DataStream-Output-Encryption-Key` 从 pair-verify shared secret 派生，只在内存使用并在会话关闭时清零。收到车机邀请后，通过同一加密 RTSP 连接执行 `/info`、初始 SETUP、屏幕 SETUP、视频 TCP 数据口连接和 RECORD；维持 RTSP feedback 与视频数据口 keep-alive，视频数据口发送串行化以避免并发帧/心跳交错。初始 SETUP 返回事件端口时，按方向派生 HomeKit Events 密钥并连接 TCP 事件通道，分帧解析请求/应答，只确认请求（回显合法 CSeq）；事件命令目前仅确认，不处理触摸/HID 或 CarPlay 控制语义。新增 NAPI `OH_AVScreenCapture` H.264 编码输出；用户主动点击“开始投屏”后，创建 1280x720 虚拟显示和 CarPlayer 应用窗口，并只采集该虚拟显示，不采集手机物理屏幕或其他应用。需系统授予 `ACCESS_VIRTUAL_SCREEN` 与 `SYSTEM_FLOAT_WINDOW`；权限/窗口/采集失败会明确报错，不回退到物理屏镜像。采集缓冲区队列有界，溢出会显式终止投屏；处理 codec data、分片和 Annex-B/长度前缀 NAL 后发送加密帧，只有首帧成功发送后状态才进入“投屏中”。虚拟屏权限、编码回调、车机解码和实机画面仍需 PLR-AL00 与接收端验收，不能据 HAP 构建或协议测试宣称已经可正常投屏。
+- 新增媒体 wire codec：H.264 Annex-B/长度前缀 NAL 归一化、avcC 配置、128 字节屏幕流配置/帧/keepalive 封装、帧 ChaCha AAD/nonce，以及大端 PCM RTP/ChaCha 封包；有协议单测。视频流密钥按 `DataStream-Salt<streamConnectionID>` / `DataStream-Output-Encryption-Key` 从 pair-verify shared secret 派生，只在内存使用并在会话关闭时清零。收到车机邀请后，通过同一加密 RTSP 连接执行 `/info`、初始 SETUP、屏幕 SETUP、视频 TCP 数据口连接和 RECORD；维持 RTSP feedback 与视频数据口 keep-alive，视频数据口发送串行化以避免并发帧/心跳交错。初始 SETUP 返回事件端口时，按方向派生 HomeKit Events 密钥并连接 TCP 事件通道，分帧解析请求/应答，只确认请求（回显合法 CSeq）；事件命令目前仅确认，不处理触摸/HID 或 CarPlay 控制语义。新增 NAPI `OH_AVScreenCapture` H.264 编码输出与 `OH_ConsumerSurface_Create` 的真实虚拟屏 Surface；帧回调只通知专用工作线程，工作线程负责 acquire/release NativeWindowBuffer。用户主动点击“开始投屏”后，创建 1280x720 虚拟显示，并用 `UIAbilityContext.startAbility` 将独立 `ProjectionAbility` 定向到该 display，只采集该虚拟显示，不采集手机物理屏幕或其他应用。避免依赖需 `SYSTEM_FLOAT_WINDOW` 的 `window.createWindow`；仍需系统授予 `ACCESS_VIRTUAL_SCREEN`，任何权限/Ability/采集失败会明确报错，不回退到物理屏镜像。采集缓冲区队列有界，溢出会显式终止投屏；处理 codec data、分片和 Annex-B/长度前缀 NAL 后发送加密帧，只有首帧成功发送后状态才进入“投屏中”。虚拟屏权限、Ability 启动、编码回调、车机解码和实机画面仍需 PLR-AL00 与接收端验收，不能据 HAP 构建或协议测试宣称已经可正常投屏。
 - 已补充 `0x4301 CarPlayStartSession` 解析：提取 AirPlay IP/端口和新协议无线组中的 Wi-Fi 参数；收到热点参数后加入 Wi-Fi，绑定成功后可用 iAP2 端点或 mDNS 端点探测 RTSP。
 - `GET_NETWORK_INFO` 已加入权限声明和运行时权限请求。此前的普通签名 HAP 已安装并在 PLR-AL00 启动，真机确认单开关、状态和滚动日志页面正常显示；早期探测显示虚拟屏能力未授予，且 phone 目标不支持触摸控制器。曾用本机签名材料和 ACL profile 验证 HAP 代码签名及权限签名，但设备拒绝安装该包（错误 `9568322`：应用来源不受信任），因此尚未验证 ACL 权限是否授予；本地签名材料现已从工作树移除。
 - 历史 `phoneDebug` 构建和权限签名验证不代表当前配置。本轮读取的产品为 `default`，使用既有 `localCerts` 签名；未修改用户签名配置或凭据。核验现有 profile 的 APL 为 `normal`，应用特征为 `hos_normal_app`，ACL 不含 `GET_BLUETOOTH_LOCAL_MAC`。
-- 早期 phone 验证时，本机签名未获虚拟屏权限，未声明 `CONTROL_DEVICE`；此前覆盖安装结果只适用于当时的 HAP，不代表本轮代码已部署。当前提交重新声明虚拟屏与浮动窗口所需权限并实现隔离的应用虚拟屏路径；是否获得系统授权仍需在目标设备运行确认。
+- 早期 phone 验证时，本机签名未获虚拟屏权限，未声明 `CONTROL_DEVICE`；此前覆盖安装结果只适用于当时的 HAP，不代表本轮代码已部署。当前实现通过 ConsumerSurface 与定向启动的 `ProjectionAbility` 建立隔离的应用虚拟屏路径；是否获得系统授权仍需在目标设备运行确认。
 - 真机蓝牙探测已运行：系统报告 9 个已配对设备，但均未建立 iAP2 RFCOMM 连接；当前未连接 CarPlay 车机，因此 iAP2 后续交换、Wi-Fi 入网、mDNS 和 RTSP 均未实测。
 - 本机真实蓝牙地址对应系统接口 `access.getLocalAddress()`，不是 Socket 的远端 `getDeviceId()`。公开 SDK 不包含该系统方法的 ArkTS 声明；实现使用有类型声明的小型 JS 兼容边界检测方法是否存在，调用前仍严格核验两项权限，完全保留系统应用身份与权限检查。当前签名不足以自动读取；用户后续明确允许填写本机真实地址作为备用，不再因缺少系统权限而无条件阻断该配置路径。
 - 早期版本曾在 PLR-AL00 运行并通过 3 项 Hypium 测试，但没有覆盖采集授权、编码输出、CarPlay 接收端或画面解码。此处历史验收不能替代本轮部署/实测；真实接收端与画面解码仍未验收。
@@ -133,14 +133,14 @@ if (-not (Test-Path '.\build-profile.json5')) {
 | 车机热点 | WLAN candidate network API；尽量使用应用维度候选网络，避免意外改动系统默认网络 | 官方文档支持应用维度候选网络，且可与系统 WLAN 配置隔离；API 需要 `ohos.permission.SET_WIFI_INFO`。WEP 不支持 candidate config，目标设备上的入网、路由及多网络套接字选择需 POC |
 | mDNS / Bonjour | `@kit.NetworkKit` mDNS 注册、发现和解析；Socket Kit TCP/UDP | 官方有对应 API。需验证 `_carplay-ctrl._tcp` TXT/端口、服务刷新、绑定目标热点及 IPv6 link-local scope |
 | TCP/UDP AirPlay 与媒体流 | `@kit.NetworkKit` Socket Kit；保留 RTSP 控制、事件 TCP、视频 TCP、音频 UDP 的独立连接和读写线程 | 公共网络能力可承载；需要验证切前后台、热点丢失及应用生命周期下连接的保活/恢复 |
-| 虚拟屏创建与销毁 | `@ohos.display` `createVirtualScreen` / `destroyVirtualScreen`，屏幕 Surface 绑定到虚拟屏 | 当前 phone 目标被 SDK 标记为 API 不可用；普通签名 HAP 也无法获授 `ACCESS_VIRTUAL_SCREEN` 并被设备拒绝安装。需厂商/系统集成及支持该 API 的设备类型 |
-| 在虚拟屏启动 Ability | `UIAbilityContext.startAbility(want, { displayId })` | API 文档提供 `displayId` 选项；这只说明可指定显示屏，不代表普通应用可创建屏、任意第三方 Ability 都支持目标显示屏，也不保证商业 HarmonyOS 设备开放该能力 |
+| 虚拟屏创建与销毁 | `@ohos.display` `createVirtualScreen` / `destroyVirtualScreen`，屏幕 Surface 绑定到真实 ConsumerSurface | 当前 phone 目标被 SDK 标记为 API 不可用；本轮 HAP 已安装，但设备锁屏期间未能启动应用，虚拟屏权限与运行时结果仍未验证。需厂商/系统集成及支持该 API 的设备类型 |
+| 在虚拟屏启动 Ability | `UIAbilityContext.startAbility(want, { displayId })` | API 文档提供 `displayId` 选项；实现已改为启动独立 `ProjectionAbility`，但设备锁屏时启动命令被拒绝，尚未验证实际显示，也不代表任意 Ability 都支持目标显示屏 |
 | 触摸回注 | 在支持该 API 的系统/特权目标上，使用 SDK API 26 `@ohos.multimodalInput.inputEventClient` 的 `TouchController.touchDown/touchMove/touchUp`，按 `displayId` 构造触点 | 当前 phone 目标被 SDK 标记为 API 不可用，因此 phone 包不声明 `CONTROL_DEVICE` 或执行触摸探测；其他目标类型需厂商/系统集成后单独验证 |
 | H.264 编码 | AVCodec Kit 原生 surface 输入模式，封装为 N-API/ArkTS 可调用的媒体适配器 | 官方提供硬件视频编码 surface 模式；需验证虚拟屏输出 Surface 能否直接连接编码器输入 Surface，无法直连时测量一次 GPU 合成/拷贝的成本 |
 | 音频采集与编码 | Harmony 音频采集/编码 API 独立适配 | **待 POC**：确认是否能按现有 Android AudioPlaybackCapture 语义采集其他应用播放音频、授权 UX 与后台限制；不能将麦克风采集等同于系统播放音频采集 |
 | 设备身份 | 适配 iAP2/AirPlay 需要的设备名、蓝牙地址及连接端点 | **待 POC/高风险**：Bluetooth Socket 文档说明 `getDeviceId()` 为隐私保护返回虚拟 MAC。不能直接假设它可替代 CarDeck 依赖的真实稳定蓝牙地址；应从目标系统权限/API 与车机侧校验确认 |
 
-目标设备 API 版本为 26。普通签名真机探测显示当前签名未获授 `ACCESS_VIRTUAL_SCREEN`；加入受限权限请求后，普通签名 HAP 安装被系统拒绝。曾用本机 ACL profile 验证签名，但目标设备以“不受信任的应用来源”拒绝安装，因此尚不能宣称真机权限已授予。当前模块目标是 phone，SDK 将虚拟屏和触摸控制器 API 均标记为不可用；应用使用用户授权的当前显示器采集，不依赖虚拟屏，也不声明 `CONTROL_DEVICE`。完整显示/回控能力仍需取得设备可接受的安装/信任路径，并适配支持这些 API 的目标类型。
+目标设备 API 版本为 26。本轮移除需要系统授权的 `SYSTEM_FLOAT_WINDOW` 和 `window.createWindow`，改用独立 `ProjectionAbility` 定向启动；签名 HAP 已于 2026-10-22 成功安装到 PLR-AL00。随后启动命令因设备锁屏失败（错误 `10106102`，开发者模式下不能自动解锁），所以尚未验证 `ACCESS_VIRTUAL_SCREEN` 的运行时授权、虚拟屏创建或画面输出。当前模块目标是 phone，SDK 将虚拟屏和触摸控制器 API 均标记为不可用；不能据成功安装推断这些 API 可用。完整显示/回控能力仍需解锁后在目标设备验证，并可能需要厂商/系统集成及支持这些 API 的目标类型。
 
 ## 推荐架构
 
@@ -175,7 +175,7 @@ if (-not (Test-Path '.\build-profile.json5')) {
 
 先在**最终目标设备和最终签名类型**上做最小验证。模拟器、开发者签名或 OpenHarmony 开发板通过，不代表商业 HarmonyOS 设备上权限可用。
 
-1. **权限门**：普通签名 HAP 请求 `ACCESS_VIRTUAL_SCREEN` 后安装失败；使用提供的 ACL profile 后，本机验证代码签名和权限签名成功，但 PLR-AL00 仍以不受信任来源拒绝安装。phone 目标上的虚拟屏和触摸控制器 API 均被 SDK 标记为不可用；需先解决安装信任路径，并选择支持这些 API 的目标类型，之后才能验证完整显示链路。
+1. **权限门**：移除 `SYSTEM_FLOAT_WINDOW` 后，本轮普通签名 HAP 已成功安装；启动测试因 PLR-AL00 锁屏未能执行。解锁后仍需确认 `ACCESS_VIRTUAL_SCREEN` 是否获授及 API 是否可用；phone 目标上的虚拟屏和触摸控制器 API 均被 SDK 标记为不可用。
 2. **显示门**：创建一块横屏虚拟屏，将一个自有 Ability 指定到该 `displayId`；再启动一个目标第三方应用验证它是否真的绘制在该屏。检查尺寸、密度、方向、焦点、黑屏/息屏、应用退到后台后的存活行为。
 3. **编码门**：创建 AVCodec surface 输入，验证虚拟屏最终合成画面能以目标 H.264 profile、分辨率和帧率进入编码器。连续采集至少 10 分钟，检查掉帧、内存/图形资源增长、屏幕 resize 和编码器销毁重建。
 4. **输入门**：从指定屏幕注入单指点击、长按、滑动，以及目标应用需要的多指手势；验证事件落到正确 display/window，坐标边缘、旋转和地图屏 resize 均正确。
@@ -219,7 +219,7 @@ if (-not (Test-Path '.\build-profile.json5')) {
 
 | 风险 | 影响 | 处理/退出条件 |
 |---|---|---|
-| phone 上的虚拟屏 API 不可用，且普通签名不能获授 `ACCESS_VIRTUAL_SCREEN` | 普通应用不能自建等价显示；请求权限还会导致 HAP 安装失败 | ACL 签名与权限签名可本地验证，但 PLR-AL00 拒绝该应用来源；仍需解决设备信任，随后还需厂商/系统集成及支持的目标类型 |
+| phone 上的虚拟屏 API 不可用，且普通签名不能获授 `ACCESS_VIRTUAL_SCREEN` | 普通应用不能自建等价显示；当前 phone SDK 将 API 标为不可用 | 本轮 HAP 已安装，但因锁屏未运行；解锁后验证实际权限与 API 结果，完整能力可能仍需厂商/系统集成及支持的目标类型 |
 | API 26 phone 目标不支持触摸控制器 | phone 版本不能将车机触摸回控到目标显示屏 | phone 包不声明 `CONTROL_DEVICE`，也不执行无效的触摸 API 探测；需在支持该 API 的系统/特权目标上另行验证 |
 | HarmonyOS NEXT 与 OpenHarmony API/权限不等价 | 开发板可行但量产机不可用 | 按具体 Harmony 设备和最终签名做 POC；所有系统 API 建 capability adapter |
 | Ability 对 displayId 的实际支持存在应用差异 | 屏创建成功但第三方应用仍在主屏或拒绝启动 | 选定导航/媒体/设置等目标应用做逐类测试；记录白名单与不支持应用 |
