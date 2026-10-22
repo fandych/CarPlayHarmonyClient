@@ -1,5 +1,5 @@
 import cryptoFramework from '@ohos.security.cryptoFramework';
-import { Iap2Csm, Iap2CsmFrame, Iap2Param, Iap2CsmParser } from './Iap2Csm';
+import { describeIap2CsmFrame, Iap2Csm, Iap2CsmFrame, Iap2Param, Iap2CsmParser } from './Iap2Csm';
 import { CarPlayInviteProtocol } from '../airplay/CarPlayInviteProtocol';
 import { MfiVerifier, ValidatedMfiCertificate } from './MfiVerifier';
 
@@ -154,7 +154,7 @@ export class Iap2SenderSession {
   }
 
   private async handleFrame(frame: Iap2CsmFrame): Promise<void> {
-    this.log(`iAP2 rx type=0x${frame.messageId.toString(16).padStart(4, '0')}; bodyBytes=${frame.body.length}。`);
+    this.log(describeIap2CsmFrame('rx', frame));
     switch (frame.messageId) {
       case 0x1D01:
         await this.handleIdentification(frame);
@@ -451,7 +451,7 @@ export class Iap2SenderSession {
 
   private sendMessage(messageId: number, body: Uint8Array = new Uint8Array(0)): void {
     if (this.active) {
-      this.log(`iAP2 tx type=0x${messageId.toString(16).padStart(4, '0')}; bodyBytes=${body.length}。`);
+      this.log(describeIap2CsmFrame('tx', { messageId, body }));
       this.sendControl(Iap2Csm.encode(messageId, body));
     }
   }

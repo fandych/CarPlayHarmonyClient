@@ -1,6 +1,5 @@
 import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
-import display from '@ohos.display';
 import { HarmonySppClient, PairedAccessory, SppConnection } from '../../platform/bluetooth/HarmonySppClient';
 import { HarmonyBluetoothIdentityProvider } from '../../platform/bluetooth/HarmonyBluetoothIdentityProvider';
 import {
@@ -21,6 +20,7 @@ import { HarmonyWifiClient } from '../../platform/network/HarmonyWifiClient';
 import { AirPlayServiceEndpoint, HarmonyMdnsBrowser } from '../../platform/network/HarmonyMdnsBrowser';
 import { HarmonyAirPlayClient } from '../../platform/network/HarmonyAirPlayClient';
 import { HarmonyAirPlayMediaSession } from '../../platform/network/HarmonyAirPlayMediaSession';
+import { HarmonyVirtualDisplay } from '../../platform/network/HarmonyVirtualDisplay';
 import {
   CarPlayInviteServer
 } from '../../platform/network/HarmonyCarPlayInviteServer';
@@ -72,6 +72,7 @@ class CarPlaySessionController {
   private state: CarPlaySessionState = 'idle';
   private abilityContext: common.UIAbilityContext | undefined = undefined;
   private generation: number = 0;
+  private projectionRequest: number = 0;
   private connection: SppConnection | undefined = undefined;
   private linkEngine: Iap2LinkEngine | undefined = undefined;
   private senderSession: Iap2SenderSession | undefined = undefined;
@@ -79,6 +80,7 @@ class CarPlaySessionController {
   private mdnsBrowser: HarmonyMdnsBrowser | undefined = undefined;
   private inviteServer: CarPlayInviteServer | undefined = undefined;
   private airPlayMediaSession: HarmonyAirPlayMediaSession | undefined = undefined;
+  private virtualDisplay: HarmonyVirtualDisplay | undefined = undefined;
   private pendingStartSession: CarPlayStartSessionEndpoint | undefined = undefined;
   private latestAirPlayEndpoint: AirPlayServiceEndpoint | undefined = undefined;
   private readonly airPlayProbeKeys: Set<string> = new Set<string>();
@@ -368,6 +370,21 @@ class CarPlaySessionController {
       });
       this.linkEngine = link;
       link.onStateChanged = (state: Iap2LinkState) => this.onLinkState(state, generation);
+      link.onDiagnostic = (direction, packet) => {
+        const payloadBytes = packet.payload === null ? 0 : packet.payload.length;
+        const payloadKind = packet.payload === null ? 'none' :
+          packet.sessionId === 0 ? 'link-sync' : 'iAP2-control';
+        const flags = [
+          (packet.control & 0x80) !== 0 ? 'SYN' : '',
+          (packet.control & 0x40) !== 0 ? 'ACK' : '',
+          (packet.control & 0x10) !== 0 ? 'RESET' : ''
+        ].filter((flag: string) => flag.length > 0).join('|') || 'DATA';
+        this.appendLog(
+          `iAP2 link ${direction} flags=${flags}; control=0x${packet.control.toString(16).padStart(2, '0')}; ` +
+          `seq=${packet.sequence}; ack=${packet.acknowledgement}; session=${packet.sessionId}; ` +
+          `payload=${payloadKind}; payloadBytes=${payloadBytes}。`
+        );
+      };
       link.onControl = (bytes: Uint8Array) => this.onControlBytes(bytes, generation);
       connection.onData((data: ArrayBuffer) => {
         if (this.isCurrent(generation)) {
@@ -399,7 +416,7 @@ class CarPlaySessionController {
     }
   }
 
-  startProjection(): void {
+  async startProjection(): Promise<void> {
     if (this.state !== 'waiting-video') {
       throw new Error('Projection can start only after the AirPlay media channel is ready.');
     }
@@ -407,54 +424,96 @@ class CarPlaySessionController {
     if (mediaSession === undefined) {
       throw new Error('The AirPlay media session is no longer available.');
     }
-    const generation = this.generation;
-    const screen = display.getDefaultDisplaySync();
-    if (screen.width < 2 || screen.height < 2) {
-      throw new Error('The system returned invalid screen dimensions.');
+    const context = this.abilityContext;
+    if (context === undefined) {
+      throw new Error('The application context is not available for virtual display creation.');
     }
-    const scale = Math.min(1, 1280 / Math.max(screen.width, screen.height));
-    const width = Math.max(2, Math.floor(screen.width * scale / 2) * 2);
-    const height = Math.max(2, Math.floor(screen.height * scale / 2) * 2);
+    const generation = this.generation;
+    const request = ++this.projectionRequest;
+    if (this.virtualDisplay !== undefined) {
+      try {
+        await this.closeVirtualDisplay();
+      } catch (error) {
+        this.appendLog(`清理上一轮 CarPlayer 虚拟显示失败：${describeFailure(error)}`, true);
+        throw error instanceof Error ? error : new Error(describeFailure(error));
+      }
+    }
     this.setState('screen-capture-pending');
     try {
+      const virtualDisplay = await HarmonyVirtualDisplay.create(context, (message: string, error?: boolean) => {
+        this.appendLog(message, error === true);
+      });
+      if (!this.isCurrent(generation) || request !== this.projectionRequest ||
+        this.airPlayMediaSession !== mediaSession) {
+        await virtualDisplay.close();
+        return;
+      }
+      this.virtualDisplay = virtualDisplay;
       mediaSession.startScreenCapture(
-        width,
-        height,
-        screen.id,
+        virtualDisplay.width,
+        virtualDisplay.height,
+        virtualDisplay.displayId,
         () => {
-          if (this.isCurrent(generation) && this.airPlayMediaSession === mediaSession) {
+          if (this.isCurrent(generation) && request === this.projectionRequest &&
+            this.airPlayMediaSession === mediaSession) {
             this.setState('streaming');
           }
         },
         (reason: string) => {
-          if (this.isCurrent(generation) && this.airPlayMediaSession === mediaSession) {
+          if (this.isCurrent(generation) && request === this.projectionRequest &&
+            this.airPlayMediaSession === mediaSession) {
             this.appendLog(`系统停止屏幕采集：${reason}`);
+            void this.closeVirtualDisplay().catch((error: Error) => {
+              this.appendLog(`关闭 CarPlayer 虚拟显示失败：${describeFailure(error)}`, true);
+            });
             this.setState('waiting-video');
           }
         }
       );
+      this.appendLog(`已请求采集 CarPlayer 虚拟屏：display=${virtualDisplay.displayId}，` +
+        `size=${virtualDisplay.width}x${virtualDisplay.height}；手机物理屏幕未被选为采集源。`);
     } catch (error) {
-      this.setState('waiting-video');
+      if (request !== this.projectionRequest || !this.isCurrent(generation)) {
+        return;
+      }
+      if (request === this.projectionRequest && this.isCurrent(generation)) {
+        this.setState('waiting-video');
+      }
+      try {
+        await this.closeVirtualDisplay();
+      } catch (cleanupError) {
+        this.appendLog(`启动失败后清理虚拟显示也失败：${describeFailure(cleanupError)}`, true);
+      }
       const failure = error instanceof Error ? error : new Error(String(error));
-      this.appendLog(`启动用户授权屏幕采集失败：${describeFailure(failure)}`, true);
+      this.appendLog(`创建虚拟屏或启动 CarPlayer 投屏失败：${describeFailure(failure)}`, true);
       throw failure;
     }
   }
 
   async stopProjection(): Promise<void> {
+    this.projectionRequest++;
     const mediaSession = this.airPlayMediaSession;
-    if (mediaSession === undefined) {
-      return;
+    let captureFailure: Error | undefined = undefined;
+    if (mediaSession !== undefined) {
+      try {
+        await mediaSession.stopScreenCapture();
+      } catch (error) {
+        captureFailure = error instanceof Error ? error : new Error(describeFailure(error));
+      }
     }
-    await mediaSession.stopScreenCapture();
+    await this.closeVirtualDisplay();
     if (this.airPlayMediaSession === mediaSession &&
       (this.state === 'screen-capture-pending' || this.state === 'streaming')) {
       this.setState('waiting-video');
+    }
+    if (captureFailure !== undefined) {
+      throw captureFailure;
     }
   }
 
   stop(): void {
     this.generation++;
+    this.projectionRequest++;
     this.resolveMfiTrust(false);
     this.sppClient.stop();
     this.identityProvider = undefined;
@@ -495,8 +554,30 @@ class CarPlaySessionController {
     if (this.airPlayMediaSession !== undefined) {
       const mediaSession = this.airPlayMediaSession;
       this.airPlayMediaSession = undefined;
-      cleanupTasks.push(mediaSession.close().catch((error: Error) => {
-        this.appendLog(`关闭 AirPlay 媒体会话失败：${describeFailure(error)}`, true);
+      const virtualDisplay = this.virtualDisplay;
+      this.virtualDisplay = undefined;
+      cleanupTasks.push((async (): Promise<void> => {
+        try {
+          await mediaSession.close();
+        } catch (error) {
+          this.appendLog(`关闭 AirPlay 媒体会话失败：${describeFailure(error)}`, true);
+        }
+        if (virtualDisplay !== undefined) {
+          try {
+            await virtualDisplay.close();
+            this.appendLog('CarPlayer 虚拟窗口与显示器已释放。');
+          } catch (error) {
+            this.appendLog(`关闭 CarPlayer 虚拟显示失败：${describeFailure(error)}`, true);
+          }
+        }
+      })());
+    } else if (this.virtualDisplay !== undefined) {
+      const virtualDisplay = this.virtualDisplay;
+      this.virtualDisplay = undefined;
+      cleanupTasks.push(virtualDisplay.close().then(() => {
+        this.appendLog('CarPlayer 虚拟窗口与显示器已释放。');
+      }).catch((error: Error) => {
+        this.appendLog(`关闭 CarPlayer 虚拟显示失败：${describeFailure(error)}`, true);
       }));
     }
     if (this.mdnsBrowser !== undefined) {
@@ -968,6 +1049,16 @@ class CarPlaySessionController {
 
   private appendLog(message: string, error: boolean = false): void {
     carPlayDiagnostics.log('session', message, error);
+  }
+
+  private async closeVirtualDisplay(): Promise<void> {
+    const virtualDisplay = this.virtualDisplay;
+    if (virtualDisplay === undefined) {
+      return;
+    }
+    this.virtualDisplay = undefined;
+    await virtualDisplay.close();
+    this.appendLog('CarPlayer 虚拟窗口与显示器已释放。');
   }
 
   private setState(state: CarPlaySessionState): void {

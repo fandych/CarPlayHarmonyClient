@@ -1,6 +1,7 @@
 import { Iap2LinkPacket, Iap2LinkPacketData, Iap2LinkStreamParser } from './Iap2LinkPacket';
 
 export type Iap2LinkState = 'idle' | 'negotiating' | 'normal' | 'dead';
+export type Iap2LinkDiagnostic = (direction: 'rx' | 'tx', packet: Iap2LinkPacketData) => void;
 
 interface Iap2SessionDescriptor {
   id: number;
@@ -108,6 +109,7 @@ export class Iap2LinkEngine {
   state: Iap2LinkState = 'idle';
   onControl: ((bytes: Uint8Array) => void) | undefined = undefined;
   onStateChanged: ((state: Iap2LinkState) => void) | undefined = undefined;
+  onDiagnostic: Iap2LinkDiagnostic | undefined = undefined;
 
   private readonly writeBytes: (bytes: Uint8Array) => void;
   private readonly parser: Iap2LinkStreamParser = new Iap2LinkStreamParser();
@@ -125,16 +127,13 @@ export class Iap2LinkEngine {
       return;
     }
     this.setState('negotiating');
-    this.writeBytes(concatenate(
-      MARKER,
-      Iap2LinkPacket.encode({
-        control: SYNCHRONIZE,
-        sequence: this.transmitSequence,
-        acknowledgement: this.receiveSequence,
-        sessionId: 0,
-        payload: encodeSynchronization(localSynchronization())
-      })
-    ));
+    this.writePacket({
+      control: SYNCHRONIZE,
+      sequence: this.transmitSequence,
+      acknowledgement: this.receiveSequence,
+      sessionId: 0,
+      payload: encodeSynchronization(localSynchronization())
+    }, true);
   }
 
   feed(bytes: Uint8Array): void {
@@ -143,6 +142,7 @@ export class Iap2LinkEngine {
     }
     const packets = this.parser.offer(bytes);
     for (let index = 0; index < packets.length; index++) {
+      this.onDiagnostic?.('rx', packets[index]);
       this.handlePacket(packets[index]);
     }
   }
@@ -152,13 +152,13 @@ export class Iap2LinkEngine {
       throw new Error('iAP2 control session is not ready');
     }
     this.transmitSequence = nextSequence(this.transmitSequence);
-    this.writeBytes(Iap2LinkPacket.encode({
+    this.writePacket({
       control: ACKNOWLEDGEMENT,
       sequence: this.transmitSequence,
       acknowledgement: this.receiveSequence,
       sessionId: this.controlSessionId,
       payload
-    }));
+    });
   }
 
   close(): void {
@@ -185,13 +185,13 @@ export class Iap2LinkEngine {
         const echo = localSynchronization(synchronization.sessions);
         echo.maxOutgoing = 0x7F;
         this.transmitSequence = nextSequence(this.transmitSequence);
-        this.writeBytes(Iap2LinkPacket.encode({
+        this.writePacket({
           control: SYNCHRONIZE | ACKNOWLEDGEMENT,
           sequence: this.transmitSequence,
           acknowledgement: packet.sequence,
           sessionId: 0,
           payload: encodeSynchronization(echo)
-        }));
+        }, true);
       } else {
         this.sendAcknowledgement();
         this.setState('normal');
@@ -212,13 +212,19 @@ export class Iap2LinkEngine {
   }
 
   private sendAcknowledgement(): void {
-    this.writeBytes(Iap2LinkPacket.encode({
+    this.writePacket({
       control: ACKNOWLEDGEMENT,
       sequence: this.transmitSequence,
       acknowledgement: this.receiveSequence,
       sessionId: 0,
       payload: null
-    }));
+    });
+  }
+
+  private writePacket(packet: Iap2LinkPacketData, includeMarker: boolean = false): void {
+    this.onDiagnostic?.('tx', packet);
+    const encoded = Iap2LinkPacket.encode(packet);
+    this.writeBytes(includeMarker ? concatenate(MARKER, encoded) : encoded);
   }
 
   private setState(state: Iap2LinkState): void {

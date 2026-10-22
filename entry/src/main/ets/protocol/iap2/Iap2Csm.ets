@@ -8,6 +8,33 @@ export interface Iap2Param {
   value: Uint8Array;
 }
 
+function byteHex(bytes: Uint8Array): string {
+  const length = Math.min(bytes.length, 64);
+  let output = '';
+  for (let index = 0; index < length; index++) {
+    output += bytes[index].toString(16).padStart(2, '0');
+  }
+  return bytes.length > length ? `${output}...` : output;
+}
+
+export function describeIap2CsmFrame(direction: 'rx' | 'tx', frame: Iap2CsmFrame): string {
+  const params = Iap2Csm.parseParams(frame.body);
+  const parsedBytes = params.reduce((total: number, parameter: Iap2Param) => total + parameter.value.length + 4, 0);
+  const descriptions = params.slice(0, 64)
+    .map((parameter: Iap2Param) => `0x${parameter.id.toString(16).padStart(4, '0')}:${parameter.value.length}`);
+  if (params.length > descriptions.length) {
+    descriptions.push(`...${params.length - descriptions.length} more`);
+  }
+  const safeCapabilityHex = frame.messageId === 0x1D01
+    ? params.filter((parameter: Iap2Param) => parameter.id === 6 || parameter.id === 7)
+      .map((parameter: Iap2Param) => `p${parameter.id}=${byteHex(parameter.value)}`)
+    : [];
+  const unparsedBytes = frame.body.length - parsedBytes;
+  return `iAP2 ${direction} type=0x${frame.messageId.toString(16).padStart(4, '0')}; ` +
+    `bodyBytes=${frame.body.length}; params=[${descriptions.join(',')}]; ` +
+    `unparsedBytes=${unparsedBytes}${safeCapabilityHex.length > 0 ? `; safeCapabilityHex=[${safeCapabilityHex.join(',')}]` : ''}。`;
+}
+
 const CSM_START = 0x4040;
 const CSM_HEADER_BYTES = 6;
 const MAX_FRAME_BYTES = 0xFFFF;

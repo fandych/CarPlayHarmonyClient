@@ -9,6 +9,8 @@ import { MfiTrustPromptInfo } from '../protocol/iap2/MfiVerifier';
 struct Index {
   @State private state: CarPlaySessionState = 'idle';
   @State private deviceName: string = '';
+  @State private selectedDeviceName: string = '';
+  @State private selectedDeviceId: string = '';
   @State private carPlayEnabled: boolean = false;
   @State private ready: boolean = false;
   @State private busy: boolean = false;
@@ -33,6 +35,8 @@ struct Index {
     });
     this.unsubscribeSettings = carPlaySettings.subscribe((snapshot) => {
       this.carPlayEnabled = snapshot.settings.enabled;
+      this.selectedDeviceName = snapshot.settings.targetDeviceName;
+      this.selectedDeviceId = snapshot.settings.targetDeviceId;
       this.ready = snapshot.ready;
       this.busy = snapshot.busy;
       this.theme = snapshot.settings.theme;
@@ -88,6 +92,34 @@ struct Index {
     }
   }
 
+  private connectOrChooseDevice(): void {
+    if (!this.ready || this.busy) {
+      return;
+    }
+    if (this.selectedDeviceId.length === 0 || this.selectedDeviceName.length === 0) {
+      this.openDevicePicker();
+      return;
+    }
+    if (isCarPlaySessionActive(this.state)) {
+      return;
+    }
+    if (this.carPlayEnabled) {
+      void carPlaySessionController.start().catch((error: Error) => {
+        showPageError(this.getUIContext(), '连接接收端', error);
+      });
+    } else {
+      void carPlaySessionController.setEnabled(true).catch((error: Error) => {
+        showPageError(this.getUIContext(), '连接接收端', error);
+      });
+    }
+  }
+
+  private openDevicePicker(): void {
+    void this.getUIContext().getRouter().pushUrl({ url: 'pages/DevicePicker' }).catch((error: Error) => {
+      showPageError(this.getUIContext(), '选择接收端', error);
+    });
+  }
+
   private statusDetail(): string {
     switch (this.state) {
       case 'connecting': return '正在连接所选接收端，或等待接收端回连';
@@ -140,11 +172,11 @@ struct Index {
     Scroll() {
       Column({ space: 24 }) {
         Column({ space: 5 }) {
-          Text('CarPlay')
+          Text('CarPlayer')
             .fontSize(34)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.primary_text'))
-          Text('Harmony 无线发送端')
+          Text('Harmony 无线 CarPlay 发送端')
             .fontSize(14)
             .fontColor($r('app.color.secondary_text'))
         }
@@ -194,8 +226,30 @@ struct Index {
                 });
               })
           }
+          Divider().color($r('app.color.divider'))
+          Row({ space: 12 }) {
+            Text('设备')
+              .fontSize(18)
+              .fontColor($r('app.color.primary_text'))
+            Text(this.selectedDeviceName.length > 0 ? this.selectedDeviceName : '选择接收端')
+              .fontSize(15)
+              .fontColor($r('app.color.secondary_text'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            Button(this.selectedDeviceId.length === 0 ? '选择' :
+              isCarPlaySessionActive(this.state) ? '已连接' : '连接')
+              .enabled(this.ready && !this.busy && !isCarPlaySessionActive(this.state))
+              .onClick(() => this.connectOrChooseDevice())
+            Text('>')
+              .fontSize(20)
+              .fontColor($r('app.color.secondary_text'))
+              .onClick(() => this.openDevicePicker())
+          }
+          .width('100%')
+          .height(48)
           if (this.state === 'waiting-video') {
-            Text('开始后将投送手机当前屏幕（可能包含其他应用的可见内容）。系统会先请求授权；可随时停止。')
+            Text('开始后仅投送 CarPlayer 的虚拟屏界面；不会采集手机物理屏幕或其他应用内容。')
               .fontSize(12)
               .fontColor($r('app.color.secondary_text'))
               .width('100%')
@@ -203,11 +257,9 @@ struct Index {
               .enabled(!this.busy)
               .width('100%')
               .onClick(() => {
-                try {
-                  carPlaySessionController.startProjection();
-                } catch (error) {
+                void carPlaySessionController.startProjection().catch((error: Error) => {
                   showPageError(this.getUIContext(), '开始投屏', error);
-                }
+                });
               })
           }
           if (this.state === 'screen-capture-pending' || this.state === 'streaming') {

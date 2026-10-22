@@ -59,7 +59,7 @@ export class AirPlayVerifiedRtspSession {
 
 export class HarmonyAirPlayClient {
   async inspect(endpoint: AirPlayServiceEndpoint, log: (message: string) => void): Promise<RtspResponse> {
-    const session = new HarmonyAirPlayRtspSession();
+    const session = new HarmonyAirPlayRtspSession(log);
     try {
       await session.connect(endpoint);
       return await session.request('GET', '/info');
@@ -99,7 +99,7 @@ export class HarmonyAirPlayClient {
     if (endpoint.homeKitPairingSupported === false) {
       throw new Error('The AirPlay endpoint explicitly does not support HomeKit pairing.');
     }
-    const session = new HarmonyAirPlayRtspSession();
+    const session = new HarmonyAirPlayRtspSession(log);
     try {
       await session.connect(endpoint);
       const pairing = await this.performPairing(context, endpoint, session, log);

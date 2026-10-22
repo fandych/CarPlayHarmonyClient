@@ -24,6 +24,11 @@ export class HarmonyAirPlayRtspSession {
   private connected: boolean = false;
   private closed: boolean = false;
   private terminalError: Error | undefined = undefined;
+  private readonly log: (message: string) => void;
+
+  constructor(log: (message: string) => void) {
+    this.log = log;
+  }
 
   private readonly messageListener = (event: socket.SocketMessageInfo): void => {
     const bytes = new Uint8Array(event.message).slice();
@@ -33,7 +38,21 @@ export class HarmonyAirPlayRtspSession {
         return;
       }
       const responses = this.parser.offer(plaintext);
-      responses.forEach((response: RtspResponse) => this.resolveResponse(response));
+      responses.forEach((response: RtspResponse) => {
+        const names: string[] = [];
+        response.headers.forEach((_value: string, name: string) => {
+          const normalized = name.toLowerCase();
+          if (/^[a-z0-9-]{1,64}$/.test(normalized)) {
+            names.push(normalized);
+          }
+        });
+        const responseCseq = response.headers.get('cseq') ?? 'missing';
+        const safeResponseCseq = /^\d{1,10}$/.test(responseCseq) ? responseCseq : 'invalid';
+        this.log(`AirPlay RTSP rx status=${response.statusCode}; cseq=${safeResponseCseq}; ` +
+          `bodyBytes=${response.body.length}; headerNames=[${names.join(',')}]; ` +
+          `encrypted=${this.controlCipher !== undefined}。`);
+        this.resolveResponse(response);
+      });
     }).catch((error: Error) => {
       this.failPending(error instanceof Error ? error : new Error('Malformed RTSP response.'));
     });
@@ -52,6 +71,8 @@ export class HarmonyAirPlayRtspSession {
       throw new Error('Invalid AirPlay RTSP endpoint.');
     }
 
+    this.log(`AirPlay RTSP transport connect requested; port=${endpoint.port}; ` +
+      `addressFamily=${endpoint.host.includes(':') ? 'IPv6' : 'IPv4'}。`);
     this.client.on('message', this.messageListener);
     this.client.on('error', this.errorListener);
     try {
@@ -64,6 +85,7 @@ export class HarmonyAirPlayRtspSession {
         timeout: REQUEST_TIMEOUT_MS
       });
       this.connected = true;
+      this.log('AirPlay RTSP TCP transport connected.');
     } catch (error) {
       this.detachListeners();
       this.terminalError = error instanceof Error ? error : new Error('AirPlay RTSP connection failed.');
@@ -89,11 +111,19 @@ export class HarmonyAirPlayRtspSession {
       { name: 'User-Agent', value: 'CarPlayHarmonyClient/1.0' },
       ...headers
     ]);
+    const safeTarget = /^\/[A-Za-z0-9._/-]{1,128}$/.test(target) ? target : '[redacted]';
+    const headerNames = headers.map((header: RtspRequestHeader) => header.name.toLowerCase())
+      .filter((name: string) => /^[a-z0-9-]{1,64}$/.test(name));
+    const safeMethod = /^[A-Z]{1,16}$/.test(method) ? method : '[redacted]';
+    this.log(`AirPlay RTSP tx method=${safeMethod}; target=${safeTarget}; cseq=${cseq}; ` +
+      `bodyBytes=${body.length}; headerNames=[${headerNames.join(',')}]; ` +
+      `encrypted=${this.controlCipher !== undefined}。`);
     const responsePromise = new Promise<RtspResponse>((resolve, reject) => {
       const timeout = setTimeout(() => {
         if (this.pending?.cseq === cseq) {
           this.pending = undefined;
           this.terminalError = new Error(`RTSP request ${cseq} timed out.`);
+          this.log(`AirPlay RTSP timeout cseq=${cseq}。`);
           reject(this.terminalError);
         }
       }, REQUEST_TIMEOUT_MS);

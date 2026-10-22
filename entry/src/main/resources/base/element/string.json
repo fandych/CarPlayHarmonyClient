@@ -10,7 +10,7 @@
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "CarPlayer"
     },
     {
       "name": "bluetooth_permission_reason",
@@ -23,6 +23,14 @@
     {
       "name": "system_capability_permission_reason",
       "value": "用于验证 CarPlay 虚拟屏和触摸回控所需的系统能力"
+    },
+    {
+      "name": "virtual_screen_permission_reason",
+      "value": "用于创建仅承载 CarPlayer 投屏界面的虚拟显示，不采集手机物理屏幕。"
+    },
+    {
+      "name": "projection_window_permission_reason",
+      "value": "用于在 CarPlayer 虚拟显示上显示应用投屏界面。"
     }
   ]
 }
