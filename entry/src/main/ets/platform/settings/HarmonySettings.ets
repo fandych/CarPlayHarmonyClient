@@ -56,7 +56,7 @@ function readJsonFile(path: string, maximum: number): string {
       bytes.set(new Uint8Array(buffer, 0, count), offset);
       offset += count;
     }
-    return new util.TextDecoder('utf-8', { fatal: true }).decodeWithStream(bytes);
+    return new util.TextDecoder('utf-8', { fatal: true }).decodeToString(bytes);
   } catch (error) {
     primaryFailure = error instanceof Error ? error : new Error(describeFailure(error));
     throw primaryFailure;
@@ -129,7 +129,7 @@ export class AssetWifiSecretVault implements WifiSecretVault {
     }
     let payload: WifiSecretPayload;
     try {
-      payload = JSON.parse(new util.TextDecoder('utf-8', { fatal: true }).decodeWithStream(secret));
+      payload = JSON.parse(new util.TextDecoder('utf-8', { fatal: true }).decodeToString(secret));
     } catch {
       throw new Error('系统安全密码记录格式损坏，拒绝使用。');
     }
